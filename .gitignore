@@ -45,6 +45,7 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.tmp/
 nosetests.xml
 coverage.xml
 *.cover
@@ -100,8 +101,10 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+.python-version
+.env*
 .venv
+.venv*
 env/
 venv/
 ENV/
@@ -140,6 +143,19 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Example runtime state
+examples/sandbox/extensions/daytona/usaspending_text2sql/.audit_log.jsonl
+examples/sandbox/extensions/daytona/usaspending_text2sql/.session_state.json
+
 # PyPI configuration file
 .pypirc
 .aider*
+
+# Redis database files
+dump.rdb
+
+tmp/
+
+# execplans
+plans/
+.vercel

@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -521,6 +521,44 @@ def test_function_with_field_optional_with_default():
         fs.params_pydantic_model(**{"required_param": "test", "optional_param": -1.0})
 
 
+def test_function_uses_annotated_descriptions_without_docstring() -> None:
+    """Test that Annotated metadata populates parameter descriptions when docstrings are ignored."""
+
+    def add(
+        a: Annotated[int, "First number to add"],
+        b: Annotated[int, "Second number to add"],
+    ) -> int:
+        return a + b
+
+    fs = function_schema(add, use_docstring_info=False)
+
+    properties = fs.params_json_schema.get("properties", {})
+    assert properties["a"].get("description") == "First number to add"
+    assert properties["b"].get("description") == "Second number to add"
+
+
+def test_function_prefers_docstring_descriptions_over_annotated_metadata() -> None:
+    """Test that docstring parameter descriptions take precedence over Annotated metadata."""
+
+    def add(
+        a: Annotated[int, "Annotated description for a"],
+        b: Annotated[int, "Annotated description for b"],
+    ) -> int:
+        """Adds two integers.
+
+        Args:
+            a: Docstring provided description.
+        """
+
+        return a + b
+
+    fs = function_schema(add)
+
+    properties = fs.params_json_schema.get("properties", {})
+    assert properties["a"].get("description") == "Docstring provided description."
+    assert properties["b"].get("description") == "Annotated description for b"
+
+
 def test_function_with_field_description_merge():
     """Test that Field descriptions are merged with docstring descriptions."""
 
@@ -657,6 +695,185 @@ def test_function_with_field_multiple_constraints():
     parsed2 = fs.params_pydantic_model(**valid_input2)
     args2, kwargs_dict2 = fs.to_call_args(parsed2)
     result2 = func_with_multiple_field_constraints(*args2, **kwargs_dict2)
+    assert result2 == "Alice scored 135.0"
+
+    # Test various validation errors
+    with pytest.raises(ValidationError):  # score too high
+        fs.params_pydantic_model(**{"score": 150})
+
+    with pytest.raises(ValidationError):  # empty name
+        fs.params_pydantic_model(**{"score": 50, "name": ""})
+
+    with pytest.raises(ValidationError):  # zero factor
+        fs.params_pydantic_model(**{"score": 50, "factor": 0.0})
+
+
+# --- Annotated + Field: same behavior as Field as default ---
+
+
+def test_function_with_annotated_field_required_constraints():
+    """Test function with required Annotated[int, Field(...)] parameter that has constraints."""
+
+    def func_with_annotated_field_constraints(
+        my_number: Annotated[int, Field(..., gt=10, le=100)],
+    ) -> int:
+        return my_number * 2
+
+    fs = function_schema(func_with_annotated_field_constraints, use_docstring_info=False)
+
+    # Check that the schema includes the constraints
+    properties = fs.params_json_schema.get("properties", {})
+    my_number_schema = properties.get("my_number", {})
+    assert my_number_schema.get("type") == "integer"
+    assert my_number_schema.get("exclusiveMinimum") == 10  # gt=10
+    assert my_number_schema.get("maximum") == 100  # le=100
+
+    # Valid input should work
+    valid_input = {"my_number": 50}
+    parsed = fs.params_pydantic_model(**valid_input)
+    args, kwargs_dict = fs.to_call_args(parsed)
+    result = func_with_annotated_field_constraints(*args, **kwargs_dict)
+    assert result == 100
+
+    # Invalid input: too small (should violate gt=10)
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"my_number": 5})
+
+    # Invalid input: too large (should violate le=100)
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"my_number": 150})
+
+
+def test_function_with_annotated_field_optional_with_default():
+    """Optional Annotated[float, Field(...)] param with default and constraints."""
+
+    def func_with_annotated_optional_field(
+        required_param: str,
+        optional_param: Annotated[float, Field(default=5.0, ge=0.0)],
+    ) -> str:
+        return f"{required_param}: {optional_param}"
+
+    fs = function_schema(func_with_annotated_optional_field, use_docstring_info=False)
+
+    # Check that the schema includes the constraints and description
+    properties = fs.params_json_schema.get("properties", {})
+    optional_schema = properties.get("optional_param", {})
+    assert optional_schema.get("type") == "number"
+    assert optional_schema.get("minimum") == 0.0  # ge=0.0
+    assert optional_schema.get("default") == 5.0
+
+    # Valid input with default
+    valid_input = {"required_param": "test"}
+    parsed = fs.params_pydantic_model(**valid_input)
+    args, kwargs_dict = fs.to_call_args(parsed)
+    result = func_with_annotated_optional_field(*args, **kwargs_dict)
+    assert result == "test: 5.0"
+
+    # Valid input with explicit value
+    valid_input2 = {"required_param": "test", "optional_param": 10.5}
+    parsed2 = fs.params_pydantic_model(**valid_input2)
+    args2, kwargs_dict2 = fs.to_call_args(parsed2)
+    result2 = func_with_annotated_optional_field(*args2, **kwargs_dict2)
+    assert result2 == "test: 10.5"
+
+    # Invalid input: negative value (should violate ge=0.0)
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"required_param": "test", "optional_param": -1.0})
+
+
+def test_function_with_annotated_field_string_constraints():
+    """Annotated[str, Field(...)] parameter with string constraints (min/max length, pattern)."""
+
+    def func_with_annotated_string_field(
+        name: Annotated[
+            str,
+            Field(..., min_length=3, max_length=20, pattern=r"^[A-Za-z]+$"),
+        ],
+    ) -> str:
+        return f"Hello, {name}!"
+
+    fs = function_schema(func_with_annotated_string_field, use_docstring_info=False)
+
+    # Check that the schema includes string constraints
+    properties = fs.params_json_schema.get("properties", {})
+    name_schema = properties.get("name", {})
+    assert name_schema.get("type") == "string"
+    assert name_schema.get("minLength") == 3
+    assert name_schema.get("maxLength") == 20
+    assert name_schema.get("pattern") == r"^[A-Za-z]+$"
+
+    # Valid input
+    valid_input = {"name": "Alice"}
+    parsed = fs.params_pydantic_model(**valid_input)
+    args, kwargs_dict = fs.to_call_args(parsed)
+    result = func_with_annotated_string_field(*args, **kwargs_dict)
+    assert result == "Hello, Alice!"
+
+    # Invalid input: too short
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"name": "Al"})
+
+    # Invalid input: too long
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"name": "A" * 25})
+
+    # Invalid input: doesn't match pattern (contains numbers)
+    with pytest.raises(ValidationError):
+        fs.params_pydantic_model(**{"name": "Alice123"})
+
+
+def test_function_with_annotated_field_multiple_constraints():
+    """Test function with multiple Annotated params with Field having different constraint types."""
+
+    def func_with_annotated_multiple_field_constraints(
+        score: Annotated[
+            int,
+            Field(..., ge=0, le=100, description="Score from 0 to 100"),
+        ],
+        name: Annotated[str, Field(default="Unknown", min_length=1, max_length=50)],
+        factor: Annotated[float, Field(default=1.0, gt=0.0, description="Positive multiplier")],
+    ) -> str:
+        final_score = score * factor
+        return f"{name} scored {final_score}"
+
+    fs = function_schema(func_with_annotated_multiple_field_constraints, use_docstring_info=False)
+
+    # Check schema structure
+    properties = fs.params_json_schema.get("properties", {})
+
+    # Check score field
+    score_schema = properties.get("score", {})
+    assert score_schema.get("type") == "integer"
+    assert score_schema.get("minimum") == 0
+    assert score_schema.get("maximum") == 100
+    assert score_schema.get("description") == "Score from 0 to 100"
+
+    # Check name field
+    name_schema = properties.get("name", {})
+    assert name_schema.get("type") == "string"
+    assert name_schema.get("minLength") == 1
+    assert name_schema.get("maxLength") == 50
+    assert name_schema.get("default") == "Unknown"
+
+    # Check factor field
+    factor_schema = properties.get("factor", {})
+    assert factor_schema.get("type") == "number"
+    assert factor_schema.get("exclusiveMinimum") == 0.0
+    assert factor_schema.get("default") == 1.0
+    assert factor_schema.get("description") == "Positive multiplier"
+
+    # Valid input with defaults
+    valid_input = {"score": 85}
+    parsed = fs.params_pydantic_model(**valid_input)
+    args, kwargs_dict = fs.to_call_args(parsed)
+    result = func_with_annotated_multiple_field_constraints(*args, **kwargs_dict)
+    assert result == "Unknown scored 85.0"
+
+    # Valid input with all parameters
+    valid_input2 = {"score": 90, "name": "Alice", "factor": 1.5}
+    parsed2 = fs.params_pydantic_model(**valid_input2)
+    args2, kwargs_dict2 = fs.to_call_args(parsed2)
+    result2 = func_with_annotated_multiple_field_constraints(*args2, **kwargs_dict2)
     assert result2 == "Alice scored 135.0"
 
     # Test various validation errors

@@ -13,10 +13,10 @@ from agents import (
     InputGuardrail,
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
-    ModelBehaviorError,
     RunContextWrapper,
     Runner,
     TResponseInputItem,
+    _debug,
 )
 
 from .fake_model import FakeModel
@@ -134,21 +134,32 @@ async def test_multi_turn_no_handoffs():
 
 
 @pytest.mark.asyncio
-async def test_tool_call_error():
+async def test_tool_call_error(monkeypatch: pytest.MonkeyPatch):
+    # Opt in to tool payload logging so the friendly "parsing tool arguments" message,
+    # which depends on inspecting the chained JSONDecodeError, is preserved.
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
     model = FakeModel(tracing_enabled=True)
 
     agent = Agent(
         name="test_agent",
         model=model,
-        tools=[get_function_tool("foo", "tool_result", hide_errors=True)],
+        tools=[get_function_tool("foo", "tool_result")],
     )
 
-    model.set_next_output(
-        [get_text_message("a_message"), get_function_tool_call("foo", "bad_json")],
+    model.add_multiple_turn_outputs(
+        [
+            [get_text_message("a_message"), get_function_tool_call("foo", "bad_json")],
+            [get_text_message("done")],
+        ]
     )
 
-    with pytest.raises(ModelBehaviorError):
-        await Runner.run(agent, input="first_test")
+    result = await Runner.run(agent, input="first_test")
+
+    tool_outputs = [item for item in result.new_items if item.type == "tool_call_output_item"]
+    assert tool_outputs, "Expected a tool output item for invalid JSON"
+    assert "An error occurred while parsing tool arguments" in str(tool_outputs[0].output)
+    assert "valid JSON" in str(tool_outputs[0].output)
 
     assert fetch_normalized_spans() == snapshot(
         [
@@ -171,11 +182,20 @@ async def test_tool_call_error():
                                     "message": "Error running tool",
                                     "data": {
                                         "tool_name": "foo",
-                                        "error": "Invalid JSON input for tool foo: bad_json",
+                                        "error": "Expecting value: line 1 column 1 (char 0)",
                                     },
                                 },
-                                "data": {"name": "foo", "input": "bad_json"},
+                                "data": {
+                                    "name": "foo",
+                                    "input": "bad_json",
+                                    "output": (
+                                        "An error occurred while parsing tool arguments. "
+                                        "Please try again with valid JSON. Error: Expecting "
+                                        "value: line 1 column 1 (char 0)"
+                                    ),
+                                },
                             },
+                            {"type": "generation"},
                         ],
                     }
                 ],

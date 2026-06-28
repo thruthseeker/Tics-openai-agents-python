@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ..logger import logger
+from .config import TracingConfig
 from .setup import get_trace_provider
 from .span_data import (
     AgentSpanData,
@@ -16,7 +17,9 @@ from .span_data import (
     ResponseSpanData,
     SpeechGroupSpanData,
     SpeechSpanData,
+    TaskSpanData,
     TranscriptionSpanData,
+    TurnSpanData,
 )
 from .spans import Span
 from .traces import Trace
@@ -30,6 +33,7 @@ def trace(
     trace_id: str | None = None,
     group_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    tracing: TracingConfig | None = None,
     disabled: bool = False,
 ) -> Trace:
     """
@@ -50,6 +54,7 @@ def trace(
         group_id: Optional grouping identifier to link multiple traces from the same conversation
             or process. For instance, you might use a chat thread ID.
         metadata: Optional dictionary of additional metadata to attach to the trace.
+        tracing: Optional tracing configuration for exporting this trace.
         disabled: If True, we will return a Trace but the Trace will not be recorded.
 
     Returns:
@@ -66,6 +71,7 @@ def trace(
         trace_id=trace_id,
         group_id=group_id,
         metadata=metadata,
+        tracing=tracing,
         disabled=disabled,
     )
 
@@ -109,6 +115,37 @@ def agent_span(
     """
     return get_trace_provider().create_span(
         span_data=AgentSpanData(name=name, handoffs=handoffs, tools=tools, output_type=output_type),
+        span_id=span_id,
+        parent=parent,
+        disabled=disabled,
+    )
+
+
+def task_span(
+    name: str,
+    span_id: str | None = None,
+    parent: Trace | Span[Any] | None = None,
+    disabled: bool = False,
+) -> Span[TaskSpanData]:
+    """Create a new task span. This represents one top-level Runner invocation."""
+    return get_trace_provider().create_span(
+        span_data=TaskSpanData(name=name),
+        span_id=span_id,
+        parent=parent,
+        disabled=disabled,
+    )
+
+
+def turn_span(
+    turn: int,
+    agent_name: str,
+    span_id: str | None = None,
+    parent: Trace | Span[Any] | None = None,
+    disabled: bool = False,
+) -> Span[TurnSpanData]:
+    """Create a new turn span. This represents one agent loop turn."""
+    return get_trace_provider().create_span(
+        span_data=TurnSpanData(turn=turn, agent_name=agent_name),
         span_id=span_id,
         parent=parent,
         disabled=disabled,

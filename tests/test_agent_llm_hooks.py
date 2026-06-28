@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -7,7 +7,7 @@ from agents.agent import Agent
 from agents.items import ItemHelpers, ModelResponse, TResponseInputItem
 from agents.lifecycle import AgentHooks
 from agents.run import Runner
-from agents.run_context import RunContextWrapper, TContext
+from agents.run_context import AgentHookContext, RunContextWrapper, TContext
 from agents.tool import Tool
 
 from .fake_model import FakeModel
@@ -24,7 +24,7 @@ class AgentHooksForTests(AgentHooks):
     def reset(self):
         self.events.clear()
 
-    async def on_start(self, context: RunContextWrapper[TContext], agent: Agent[TContext]) -> None:
+    async def on_start(self, context: AgentHookContext[TContext], agent: Agent[TContext]) -> None:
         self.events["on_start"] += 1
 
     async def on_end(
@@ -47,7 +47,7 @@ class AgentHooksForTests(AgentHooks):
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
         tool: Tool,
-        result: str,
+        result: object,
     ) -> None:
         self.events["on_tool_end"] += 1
 
@@ -56,7 +56,7 @@ class AgentHooksForTests(AgentHooks):
         self,
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
-        system_prompt: Optional[str],
+        system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
         self.events["on_llm_start"] += 1

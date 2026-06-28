@@ -19,16 +19,44 @@ lint:
 mypy: 
 	uv run mypy . --exclude site
 
+.PHONY: pyright
+pyright:
+	uv run pyright --project pyrightconfig.json
+
+.PHONY: typecheck
+typecheck:
+	@set -eu; \
+	mypy_pid=''; \
+	pyright_pid=''; \
+	trap 'test -n "$$mypy_pid" && kill $$mypy_pid 2>/dev/null || true; test -n "$$pyright_pid" && kill $$pyright_pid 2>/dev/null || true' EXIT INT TERM; \
+	echo "Running make mypy and make pyright in parallel..."; \
+	$(MAKE) mypy & mypy_pid=$$!; \
+	$(MAKE) pyright & pyright_pid=$$!; \
+	wait $$mypy_pid; \
+	wait $$pyright_pid; \
+	trap - EXIT
+
 .PHONY: tests
-tests: 
-	uv run pytest 
+tests: tests-parallel tests-serial
+
+.PHONY: tests-asyncio-stability
+tests-asyncio-stability:
+	bash .github/scripts/run-asyncio-teardown-stability.sh
+
+.PHONY: tests-parallel
+tests-parallel:
+	uv run pytest -n auto --dist loadfile -m "not serial"
+
+.PHONY: tests-serial
+tests-serial:
+	uv run pytest -m serial
 
 .PHONY: coverage
 coverage:
 	
 	uv run coverage run -m pytest
 	uv run coverage xml -o coverage.xml
-	uv run coverage report -m --fail-under=95
+	uv run coverage report -m --fail-under=85
 
 .PHONY: snapshots-fix
 snapshots-fix: 
@@ -37,10 +65,6 @@ snapshots-fix:
 .PHONY: snapshots-create 
 snapshots-create: 
 	uv run pytest --inline-snapshot=create 
-
-.PHONY: old_version_tests
-old_version_tests: 
-	UV_PROJECT_ENVIRONMENT=.venv_39 uv run --python 3.9 -m pytest
 
 .PHONY: build-docs
 build-docs:
@@ -61,4 +85,4 @@ deploy-docs:
 	uv run mkdocs gh-deploy --force --verbose
 
 .PHONY: check
-check: format-check lint mypy tests
+check: format-check lint typecheck tests

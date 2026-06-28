@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+import copy
+from typing import Any, TypeGuard
 
 from openai import NOT_GIVEN
-from typing_extensions import TypeGuard
 
 from .exceptions import UserError
 
@@ -22,7 +22,7 @@ def ensure_strict_json_schema(
     that the OpenAI API expects.
     """
     if schema == {}:
-        return _EMPTY_SCHEMA
+        return copy.deepcopy(_EMPTY_SCHEMA)
     return _ensure_strict_json_schema(schema, path=(), root=schema)
 
 
@@ -87,6 +87,20 @@ def _ensure_strict_json_schema(
             for i, variant in enumerate(any_of)
         ]
 
+    # oneOf is not supported by OpenAI's structured outputs in nested contexts,
+    # so we convert it to anyOf which provides equivalent functionality for
+    # discriminated unions
+    one_of = json_schema.get("oneOf")
+    if is_list(one_of):
+        existing_any_of = json_schema.get("anyOf", [])
+        if not is_list(existing_any_of):
+            existing_any_of = []
+        json_schema["anyOf"] = existing_any_of + [
+            _ensure_strict_json_schema(variant, path=(*path, "oneOf", str(i)), root=root)
+            for i, variant in enumerate(one_of)
+        ]
+        json_schema.pop("oneOf")
+
     # intersections
     all_of = json_schema.get("allOf")
     if is_list(all_of):
@@ -122,9 +136,12 @@ def _ensure_strict_json_schema(
                 f"Expected `$ref: {ref}` to resolved to a dictionary but got {resolved}"
             )
 
+        # Pop the current `$ref` first so that if the resolved schema is itself a `$ref`
+        # (chained refs), we preserve it for the recursive expansion below instead of
+        # silently dropping it.
+        json_schema.pop("$ref")
         # properties from the json schema take priority over the ones on the `$ref`
         json_schema.update({**resolved, **json_schema})
-        json_schema.pop("$ref")
         # Since the schema expanded from `$ref` might not have `additionalProperties: false` applied
         # we call `_ensure_strict_json_schema` again to fix the inlined schema and ensure it's valid
         return _ensure_strict_json_schema(json_schema, path=path, root=root)

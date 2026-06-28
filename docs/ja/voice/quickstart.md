@@ -6,7 +6,7 @@ search:
 
 ## 前提条件
 
-Agents SDK の基本的な [クイックスタート手順](../quickstart.md) に従い、仮想環境をセットアップしてください。次に、SDK から音声用のオプション依存関係をインストールします:
+Agents SDK の基本の [クイックスタート手順](../quickstart.md) に従い、仮想環境をセットアップ済みであることを確認してください。その後、SDK のオプションの音声依存関係をインストールします:
 
 ```bash
 pip install 'openai-agents[voice]'
@@ -14,11 +14,11 @@ pip install 'openai-agents[voice]'
 
 ## 概念
 
-主な概念は [`VoicePipeline`][agents.voice.pipeline.VoicePipeline] で、これは 3 ステップのプロセスです:
+知っておくべき主な概念は [`VoicePipeline`][agents.voice.pipeline.VoicePipeline] です。これは 3 ステップのプロセスです:
 
-1. 音声をテキストに変換するために音声認識モデルを実行します。
-2. 通常はエージェントのワークフローであるあなたのコードを実行して、結果を生成します。
-3. 結果のテキストを音声に戻すために音声合成モデルを実行します。
+1. 音声をテキストに変換するために、speech-to-text モデルを実行します。
+2. 通常はエージェントを用いたワークフローであるコードを実行して、結果を生成します。
+3. text-to-speech モデルを実行して、結果のテキストを音声に戻します。
 
 ```mermaid
 graph LR
@@ -48,7 +48,7 @@ graph LR
 
 ## エージェント
 
-まず、いくつかのエージェントをセットアップします。この SDK でエージェントを作成したことがあれば、見覚えがあるはずです。ここでは複数のエージェント、ハンドオフ、そして 1 つのツールを用意します。
+まず、いくつかのエージェントをセットアップしましょう。この SDK でエージェントを構築したことがあれば、なじみのある内容のはずです。ここでは、いくつかのエージェント、ハンドオフ、ツールを用意します。
 
 ```python
 import asyncio
@@ -72,19 +72,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-4o-mini",
+    model="gpt-5.5",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )
@@ -124,7 +124,7 @@ async for event in result.stream():
 
 ```
 
-## すべてを組み合わせる
+## 全体の統合
 
 ```python
 import asyncio
@@ -156,19 +156,19 @@ def get_weather(city: str) -> str:
 
 spanish_agent = Agent(
     name="Spanish",
-    handoff_description="A spanish speaking agent.",
+    handoff_description="A Spanish-speaking agent.",
     instructions=prompt_with_handoff_instructions(
         "You're speaking to a human, so be polite and concise. Speak in Spanish.",
     ),
-    model="gpt-4o-mini",
+    model="gpt-5.5",
 )
 
 agent = Agent(
     name="Assistant",
     instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
+        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, hand off to the Spanish agent.",
     ),
-    model="gpt-4o-mini",
+    model="gpt-5.5",
     handoffs=[spanish_agent],
     tools=[get_weather],
 )
@@ -195,4 +195,4 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-この例を実行すると、エージェントがあなたに話しかけます。自分でエージェントに話しかけられるデモは、[examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) をご覧ください。
+この例を実行すると、エージェントが話しかけてきます！ エージェントに自分で話しかけられるデモについては、[examples/voice/static](https://github.com/openai/openai-agents-python/tree/main/examples/voice/static) の例を確認してください。

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import shutil
@@ -9,13 +11,17 @@ from mcp.types import (
     Content,
     GetPromptResult,
     ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
     PromptMessage,
+    ReadResourceResult,
     TextContent,
 )
 
 from agents.mcp import MCPServer
-from agents.mcp.server import _MCPServerWithClientSession
-from agents.mcp.util import ToolFilter
+from agents.mcp.server import _UNSET, _MCPServerWithClientSession, _UnsetType
+from agents.mcp.util import MCPToolCustomDataExtractor, MCPToolMetaResolver, ToolFilter
+from agents.tool import ToolErrorFunction
 
 tee = shutil.which("tee") or ""
 assert tee, "tee not found"
@@ -67,14 +73,26 @@ class FakeMCPServer(MCPServer):
         tools: list[MCPTool] | None = None,
         tool_filter: ToolFilter = None,
         server_name: str = "fake_mcp_server",
+        require_approval: object | None = None,
+        failure_error_function: ToolErrorFunction | None | _UnsetType = _UNSET,
+        tool_meta_resolver: MCPToolMetaResolver | None = None,
+        custom_data_extractor: MCPToolCustomDataExtractor | None = None,
     ):
-        super().__init__(use_structured_content=False)
+        super().__init__(
+            use_structured_content=False,
+            require_approval=require_approval,  # type: ignore[arg-type]
+            failure_error_function=failure_error_function,
+            tool_meta_resolver=tool_meta_resolver,
+            custom_data_extractor=custom_data_extractor,
+        )
         self.tools: list[MCPTool] = tools or []
         self.tool_calls: list[str] = []
         self.tool_results: list[str] = []
+        self.tool_metas: list[dict[str, Any] | None] = []
         self.tool_filter = tool_filter
         self._server_name = server_name
         self._custom_content: list[Content] | None = None
+        self._response_meta: dict[str, Any] | None = None
 
     def add_tool(self, name: str, input_schema: dict[str, Any]):
         self.tools.append(MCPTool(name=name, inputSchema=input_schema))
@@ -96,9 +114,15 @@ class FakeMCPServer(MCPServer):
 
         return tools
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None) -> CallToolResult:
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
         self.tool_calls.append(tool_name)
         self.tool_results.append(f"result_{tool_name}_{json.dumps(arguments)}")
+        self.tool_metas.append(meta)
 
         # Allow testing custom content scenarios
         if self._custom_content is not None:
@@ -106,6 +130,7 @@ class FakeMCPServer(MCPServer):
 
         return CallToolResult(
             content=[TextContent(text=self.tool_results[-1], type="text")],
+            _meta=self._response_meta,
         )
 
     async def list_prompts(self, run_context=None, agent=None) -> ListPromptsResult:
@@ -119,6 +144,20 @@ class FakeMCPServer(MCPServer):
         content = f"Fake prompt content for {name}"
         message = PromptMessage(role="user", content=TextContent(type="text", text=content))
         return GetPromptResult(description=f"Fake prompt: {name}", messages=[message])
+
+    async def list_resources(self, cursor: str | None = None) -> ListResourcesResult:
+        """Return empty list of resources for fake server."""
+        return ListResourcesResult(resources=[])
+
+    async def list_resource_templates(
+        self, cursor: str | None = None
+    ) -> ListResourceTemplatesResult:
+        """Return empty list of resource templates for fake server."""
+        return ListResourceTemplatesResult(resourceTemplates=[])
+
+    async def read_resource(self, uri: str) -> ReadResourceResult:
+        """Return empty resource contents for fake server."""
+        return ReadResourceResult(contents=[])
 
     @property
     def name(self) -> str:

@@ -13,27 +13,88 @@ from .scope import Scope
 from .span_data import SpanData
 
 TSpanData = TypeVar("TSpanData", bound=SpanData)
+_SPAN_METADATA_ROUTING_KEYS = ("agent_harness_id",)
 
 
 class SpanError(TypedDict):
+    """Represents an error that occurred during span execution.
+
+    Attributes:
+        message: A human-readable error description
+        data: Optional dictionary containing additional error context
+    """
+
     message: str
     data: dict[str, Any] | None
 
 
 class Span(abc.ABC, Generic[TSpanData]):
+    """Base class for representing traceable operations with timing and context.
+
+    A span represents a single operation within a trace (e.g., an LLM call, tool execution,
+    or agent run). Spans track timing, relationships between operations, and operation-specific
+    data.
+
+    Type Args:
+        TSpanData: The type of span-specific data this span contains.
+
+    Example:
+        ```python
+        # Creating a custom span
+        with custom_span("database_query", {
+            "operation": "SELECT",
+            "table": "users"
+        }) as span:
+            results = await db.query("SELECT * FROM users")
+            span.set_output({"count": len(results)})
+
+        # Handling errors in spans
+        with custom_span("risky_operation") as span:
+            try:
+                result = perform_risky_operation()
+            except Exception as e:
+                span.set_error({
+                    "message": str(e),
+                    "data": {"operation": "risky_operation"}
+                })
+                raise
+        ```
+
+        Notes:
+        - Spans automatically nest under the current trace
+        - Use context managers for reliable start/finish
+        - Include relevant data but avoid sensitive information
+        - Handle errors properly using set_error()
+    """
+
     @property
     @abc.abstractmethod
     def trace_id(self) -> str:
+        """The ID of the trace this span belongs to.
+
+        Returns:
+            str: Unique identifier of the parent trace.
+        """
         pass
 
     @property
     @abc.abstractmethod
     def span_id(self) -> str:
+        """Unique identifier for this span.
+
+        Returns:
+            str: The span's unique ID within its trace.
+        """
         pass
 
     @property
     @abc.abstractmethod
     def span_data(self) -> TSpanData:
+        """Operation-specific data for this span.
+
+        Returns:
+            TSpanData: Data specific to this type of span (e.g., LLM generation data).
+        """
         pass
 
     @abc.abstractmethod
@@ -67,6 +128,11 @@ class Span(abc.ABC, Generic[TSpanData]):
     @property
     @abc.abstractmethod
     def parent_id(self) -> str | None:
+        """ID of the parent span, if any.
+
+        Returns:
+            str | None: The parent span's ID, or None if this is a root span.
+        """
         pass
 
     @abc.abstractmethod
@@ -76,6 +142,11 @@ class Span(abc.ABC, Generic[TSpanData]):
     @property
     @abc.abstractmethod
     def error(self) -> SpanError | None:
+        """Any error that occurred during span execution.
+
+        Returns:
+            SpanError | None: Error details if an error occurred, None otherwise.
+        """
         pass
 
     @abc.abstractmethod
@@ -85,15 +156,44 @@ class Span(abc.ABC, Generic[TSpanData]):
     @property
     @abc.abstractmethod
     def started_at(self) -> str | None:
+        """When the span started execution.
+
+        Returns:
+            str | None: ISO format timestamp of span start, None if not started.
+        """
         pass
 
     @property
     @abc.abstractmethod
     def ended_at(self) -> str | None:
+        """When the span finished execution.
+
+        Returns:
+            str | None: ISO format timestamp of span end, None if not finished.
+        """
         pass
+
+    @property
+    @abc.abstractmethod
+    def tracing_api_key(self) -> str | None:
+        """The API key to use when exporting this span."""
+        pass
+
+    @property
+    def trace_metadata(self) -> dict[str, Any] | None:
+        """Trace-level metadata inherited by this span, if available."""
+        return None
 
 
 class NoOpSpan(Span[TSpanData]):
+    """A no-op implementation of Span that doesn't record any data.
+
+    Used when tracing is disabled but span operations still need to work.
+
+    Args:
+        span_data: The operation-specific data for this span.
+    """
+
     __slots__ = ("_span_data", "_prev_span_token")
 
     def __init__(self, span_data: TSpanData):
@@ -155,6 +255,10 @@ class NoOpSpan(Span[TSpanData]):
     def ended_at(self) -> str | None:
         return None
 
+    @property
+    def tracing_api_key(self) -> str | None:
+        return None
+
 
 class SpanImpl(Span[TSpanData]):
     __slots__ = (
@@ -167,6 +271,8 @@ class SpanImpl(Span[TSpanData]):
         "_prev_span_token",
         "_processor",
         "_span_data",
+        "_tracing_api_key",
+        "_trace_metadata",
     )
 
     def __init__(
@@ -176,6 +282,8 @@ class SpanImpl(Span[TSpanData]):
         parent_id: str | None,
         processor: TracingProcessor,
         span_data: TSpanData,
+        tracing_api_key: str | None,
+        trace_metadata: dict[str, Any] | None = None,
     ):
         self._trace_id = trace_id
         self._span_id = span_id or util.gen_span_id()
@@ -186,6 +294,8 @@ class SpanImpl(Span[TSpanData]):
         self._error: SpanError | None = None
         self._prev_span_token: contextvars.Token[Span[TSpanData] | None] | None = None
         self._span_data = span_data
+        self._tracing_api_key = tracing_api_key
+        self._trace_metadata = trace_metadata
 
     @property
     def trace_id(self) -> str:
@@ -251,8 +361,16 @@ class SpanImpl(Span[TSpanData]):
     def ended_at(self) -> str | None:
         return self._ended_at
 
+    @property
+    def tracing_api_key(self) -> str | None:
+        return self._tracing_api_key
+
+    @property
+    def trace_metadata(self) -> dict[str, Any] | None:
+        return self._trace_metadata
+
     def export(self) -> dict[str, Any] | None:
-        return {
+        payload = {
             "object": "trace.span",
             "id": self.span_id,
             "trace_id": self.trace_id,
@@ -262,3 +380,20 @@ class SpanImpl(Span[TSpanData]):
             "span_data": self.span_data.export(),
             "error": self._error,
         }
+        metadata: dict[str, Any] = {}
+        if self._trace_metadata is not None:
+            metadata.update(
+                {
+                    key: self._trace_metadata[key]
+                    for key in _SPAN_METADATA_ROUTING_KEYS
+                    if key in self._trace_metadata
+                }
+            )
+        span_data_metadata = getattr(self.span_data, "metadata", None)
+        if isinstance(span_data_metadata, dict):
+            metadata.update(
+                {key: value for key, value in span_data_metadata.items() if key not in metadata}
+            )
+        if metadata:
+            payload["metadata"] = metadata
+        return payload

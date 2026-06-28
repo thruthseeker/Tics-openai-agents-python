@@ -1,6 +1,7 @@
 import asyncio
+import inspect
 import json
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 from inline_snapshot import snapshot
@@ -16,7 +17,9 @@ class DummyContext:
 
 
 def ctx_wrapper() -> ToolContext[DummyContext]:
-    return ToolContext(context=DummyContext(), tool_name="dummy", tool_call_id="1")
+    return ToolContext(
+        context=DummyContext(), tool_name="dummy", tool_call_id="1", tool_arguments=""
+    )
 
 
 @function_tool
@@ -146,8 +149,17 @@ async def test_no_error_on_invalid_json_async():
     assert result == "error_ModelBehaviorError"
 
 
+@function_tool(defer_loading=True)
+def deferred_lookup(customer_id: str) -> str:
+    return customer_id
+
+
+def test_function_tool_defer_loading():
+    assert deferred_lookup.defer_loading is True
+
+
 @function_tool(strict_mode=False)
-def optional_param_function(a: int, b: Optional[int] = None) -> str:
+def optional_param_function(a: int, b: int | None = None) -> str:
     if b is None:
         return f"{a}_no_b"
     return f"{a}_{b}"
@@ -174,7 +186,7 @@ async def test_non_strict_mode_function():
 def all_optional_params_function(
     x: int = 42,
     y: str = "hello",
-    z: Optional[int] = None,
+    z: int | None = None,
 ) -> str:
     if z is None:
         return f"{x}_{y}_no_z"
@@ -234,3 +246,26 @@ async def test_extract_descriptions_from_docstring():
             "additionalProperties": False,
         }
     )
+
+
+@function_tool(
+    timeout=1.25,
+    timeout_behavior="raise_exception",
+    timeout_error_function=sync_error_handler,
+)
+async def timeout_configured_tool() -> str:
+    return "ok"
+
+
+def test_decorator_timeout_configuration_is_applied() -> None:
+    assert timeout_configured_tool.timeout_seconds == 1.25
+    assert timeout_configured_tool.timeout_behavior == "raise_exception"
+    assert timeout_configured_tool.timeout_error_function is sync_error_handler
+
+
+def test_function_tool_timeout_arguments_are_keyword_only() -> None:
+    signature = inspect.signature(function_tool)
+
+    assert signature.parameters["timeout"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["timeout_behavior"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["timeout_error_function"].kind is inspect.Parameter.KEYWORD_ONLY

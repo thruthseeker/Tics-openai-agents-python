@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Union
+from typing import Any, Literal, TypeAlias
 
-from typing_extensions import NotRequired, TypeAlias, TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from .config import RealtimeSessionModelSettings
 from .model_events import RealtimeModelToolCallEvent
@@ -24,15 +24,29 @@ class RealtimeModelInputTextContent(TypedDict):
     text: str
 
 
+class RealtimeModelInputImageContent(TypedDict, total=False):
+    """An image to be sent to the model.
+
+    The Realtime API expects `image_url` to be a string data/remote URL.
+    """
+
+    type: Literal["input_image"]
+    image_url: str
+    """String URL (data:... or https:...)."""
+
+    detail: NotRequired[str]
+    """Optional detail hint such as 'high', 'low', or 'auto'."""
+
+
 class RealtimeModelUserInputMessage(TypedDict):
     """A message to be sent to the model."""
 
     type: Literal["message"]
     role: Literal["user"]
-    content: list[RealtimeModelInputTextContent]
+    content: list[RealtimeModelInputTextContent | RealtimeModelInputImageContent]
 
 
-RealtimeModelUserInput: TypeAlias = Union[str, RealtimeModelUserInputMessage]
+RealtimeModelUserInput: TypeAlias = str | RealtimeModelUserInputMessage
 """A user input to be sent to the model."""
 
 
@@ -81,6 +95,9 @@ class RealtimeModelSendToolOutput:
 class RealtimeModelSendInterrupt:
     """Send an interrupt to the model."""
 
+    force_response_cancel: bool = False
+    """Force sending a response.cancel event even if automatic cancellation is enabled."""
+
 
 @dataclass
 class RealtimeModelSendSessionUpdate:
@@ -90,11 +107,11 @@ class RealtimeModelSendSessionUpdate:
     """The updated session settings to send."""
 
 
-RealtimeModelSendEvent: TypeAlias = Union[
-    RealtimeModelSendRawMessage,
-    RealtimeModelSendUserInput,
-    RealtimeModelSendAudio,
-    RealtimeModelSendToolOutput,
-    RealtimeModelSendInterrupt,
-    RealtimeModelSendSessionUpdate,
-]
+RealtimeModelSendEvent: TypeAlias = (
+    RealtimeModelSendRawMessage
+    | RealtimeModelSendUserInput
+    | RealtimeModelSendAudio
+    | RealtimeModelSendToolOutput
+    | RealtimeModelSendInterrupt
+    | RealtimeModelSendSessionUpdate
+)

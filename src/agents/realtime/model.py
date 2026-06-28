@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Callable
+from collections.abc import Callable
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -137,6 +137,14 @@ class RealtimeModelConfig(TypedDict):
     that audio is played back immediately at realtime speed. But in scenarios like phone calls or
     other remote interactions, you can set a playback tracker that lets the model know when audio
     is played to the user.
+    """
+
+    call_id: NotRequired[str]
+    """Attach to an existing realtime call instead of creating a new session.
+
+    When provided, the transport connects using the `call_id` query string parameter rather than a
+    model name. In this repository, the shipped example for this flow is SIP via the Realtime
+    Calls API.
     """
 
 

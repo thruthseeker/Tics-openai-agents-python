@@ -55,8 +55,7 @@ def test_buffer_to_audio_file_invalid_dtype():
     buffer = np.array([1.0, 2.0, 3.0], dtype=np.float64)
 
     with pytest.raises(UserError, match="Buffer must be a numpy array of int16 or float32"):
-        # Purposely ignore the type error
-        _buffer_to_audio_file(buffer)  # type: ignore
+        _buffer_to_audio_file(buffer=buffer)
 
 
 class TestAudioInput:
@@ -103,6 +102,20 @@ class TestAudioInput:
             assert wav_file.getframerate() == DEFAULT_SAMPLE_RATE
             assert wav_file.getnframes() == len(buffer)
 
+    def test_audio_input_to_base64_does_not_mutate_float32_buffer(self):
+        # Regression: to_base64() previously rebound self.buffer to int16,
+        # silently corrupting any caller-held reference to the original float32 array.
+        buffer = np.sin(2 * np.pi * 440 * np.linspace(0, 1, 100)).astype(np.float32)
+        original = buffer.copy()
+
+        audio_input = AudioInput(buffer=buffer)
+        audio_input.to_base64()
+
+        assert audio_input.buffer.dtype == np.float32
+        assert np.array_equal(audio_input.buffer, original)
+        # Calling it twice should still work and return the same encoding.
+        assert audio_input.to_base64() == audio_input.to_base64()
+
 
 class TestStreamedAudioInput:
     @pytest.mark.asyncio
@@ -121,7 +134,14 @@ class TestStreamedAudioInput:
         # Verify the queue contents
         assert streamed_input.queue.qsize() == 2
         # Test non-blocking get
-        assert np.array_equal(streamed_input.queue.get_nowait(), audio1)
+        retrieved_audio1 = streamed_input.queue.get_nowait()
+        # Satisfy type checker
+        assert retrieved_audio1 is not None
+        assert np.array_equal(retrieved_audio1, audio1)
+
         # Test blocking get
-        assert np.array_equal(await streamed_input.queue.get(), audio2)
+        retrieved_audio2 = await streamed_input.queue.get()
+        # Satisfy type checker
+        assert retrieved_audio2 is not None
+        assert np.array_equal(retrieved_audio2, audio2)
         assert streamed_input.queue.empty()

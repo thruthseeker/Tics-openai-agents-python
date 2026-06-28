@@ -8,6 +8,7 @@ The Agents SDK automatically tracks token usage for every run. You can access it
 - **input_tokens**: total input tokens sent
 - **output_tokens**: total output tokens received
 - **total_tokens**: input + output
+- **request_usage_entries**: list of per-request usage breakdowns
 - **details**:
   - `input_tokens_details.cached_tokens`
   - `output_tokens_details.reasoning_tokens`
@@ -28,6 +29,26 @@ print("Total tokens:", usage.total_tokens)
 
 Usage is aggregated across all model calls during the run (including tool calls and handoffs).
 
+### Enabling usage with third-party adapters
+
+Usage reporting varies across third-party adapters and provider backends. If you rely on adapter-backed models and need accurate `result.context_wrapper.usage` values:
+
+- With `AnyLLMModel`, usage is propagated automatically when the upstream provider returns it. For streamed Chat Completions backends, you may need `ModelSettings(include_usage=True)` before usage chunks are emitted.
+- With `LitellmModel`, some provider backends do not report usage by default, so `ModelSettings(include_usage=True)` is often required.
+
+Review the adapter-specific notes in the [Third-party adapters](models/index.md#third-party-adapters) section of the Models guide and validate the exact provider backend you plan to deploy.
+
+## Per-request usage tracking
+
+The SDK automatically tracks usage for each API request in `request_usage_entries`, useful for detailed cost calculation and monitoring context window consumption.
+
+```python
+result = await Runner.run(agent, "What's the weather in Tokyo?")
+
+for i, request in enumerate(result.context_wrapper.usage.request_usage_entries):
+    print(f"Request {i + 1}: {request.input_tokens} in, {request.output_tokens} out")
+```
+
 ## Accessing usage with sessions
 
 When you use a `Session` (e.g., `SQLiteSession`), each call to `Runner.run(...)` returns usage for that specific run. Sessions maintain conversation history for context, but each run's usage is independent.
@@ -42,7 +63,7 @@ second = await Runner.run(agent, "Can you elaborate?", session=session)
 print(second.context_wrapper.usage.total_tokens)  # Usage for second run
 ```
 
-Note that while sessions preserve conversation context between runs, the usage metrics returned by each `Runner.run()` call represent only that particular execution. In sessions, previous messages may be re-fed as input to each run, which affects the input token count in consequent turns.
+Note that while sessions preserve conversation context between runs, the usage metrics returned by each `Runner.run()` call represent only that particular execution. In sessions, previous messages may be re-fed as input to each run, which affects the input token count in subsequent turns.
 
 ## Using usage in hooks
 
@@ -55,10 +76,11 @@ class MyHooks(RunHooks):
         print(f"{agent.name} → {u.requests} requests, {u.total_tokens} total tokens")
 ```
 
-## API Reference
+## API reference
 
 For detailed API documentation, see:
 
 -   [`Usage`][agents.usage.Usage] - Usage tracking data structure
+-   [`RequestUsage`][agents.usage.RequestUsage] - Per-request usage details
 -   [`RunContextWrapper`][agents.run.RunContextWrapper] - Access usage from run context
 -   [`RunHooks`][agents.run.RunHooks] - Hook into usage tracking lifecycle

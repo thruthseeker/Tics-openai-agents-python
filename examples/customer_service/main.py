@@ -21,6 +21,7 @@ from agents import (
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
+from examples.auto_mode import input_with_fallback, is_auto_mode
 
 ### CONTEXT
 
@@ -127,13 +128,21 @@ triage_agent = Agent[AirlineAgentContext](
         "You are a helpful triaging agent. You can use your tools to delegate questions to other appropriate agents."
     ),
     handoffs=[
-        faq_agent,
-        handoff(agent=seat_booking_agent, on_handoff=on_seat_booking_handoff),
+        handoff(agent=faq_agent, tool_name_override="transfer_to_faq_agent"),
+        handoff(
+            agent=seat_booking_agent,
+            on_handoff=on_seat_booking_handoff,
+            tool_name_override="transfer_to_seat_booking_agent",
+        ),
     ],
 )
 
-faq_agent.handoffs.append(triage_agent)
-seat_booking_agent.handoffs.append(triage_agent)
+faq_agent.handoffs.append(
+    handoff(agent=triage_agent, tool_name_override="transfer_to_triage_agent")
+)
+seat_booking_agent.handoffs.append(
+    handoff(agent=triage_agent, tool_name_override="transfer_to_triage_agent")
+)
 
 
 ### RUN
@@ -143,13 +152,17 @@ async def main():
     current_agent: Agent[AirlineAgentContext] = triage_agent
     input_items: list[TResponseInputItem] = []
     context = AirlineAgentContext()
+    auto_mode = is_auto_mode()
 
     # Normally, each input from the user would be an API request to your app, and you can wrap the request in a trace()
     # Here, we'll just use a random UUID for the conversation ID
     conversation_id = uuid.uuid4().hex[:16]
 
     while True:
-        user_input = input("Enter your message: ")
+        user_input = input_with_fallback(
+            "Enter your message: ",
+            "What are your store hours?",
+        )
         with trace("Customer service", group_id=conversation_id):
             input_items.append({"content": user_input, "role": "user"})
             result = await Runner.run(current_agent, input_items, context=context)
@@ -170,6 +183,8 @@ async def main():
                     print(f"{agent_name}: Skipping item: {new_item.__class__.__name__}")
             input_items = result.to_input_list()
             current_agent = result.last_agent
+        if auto_mode:
+            break
 
 
 if __name__ == "__main__":

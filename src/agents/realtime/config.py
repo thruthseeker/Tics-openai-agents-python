@@ -1,34 +1,64 @@
 from __future__ import annotations
 
-from typing import (
-    Any,
-    Literal,
-    Union,
-)
+from collections.abc import Mapping
+from typing import Any, Literal, TypeAlias
 
-from typing_extensions import NotRequired, TypeAlias, TypedDict
+from openai.types.realtime.realtime_audio_formats import (
+    RealtimeAudioFormats as OpenAIRealtimeAudioFormats,
+)
+from typing_extensions import NotRequired, TypedDict
+
+from agents.prompts import Prompt
 
 from ..guardrail import OutputGuardrail
 from ..handoffs import Handoff
 from ..model_settings import ToolChoice
+from ..run_config import ToolErrorFormatter
 from ..tool import Tool
 
-RealtimeModelName: TypeAlias = Union[
+RealtimeModelName: TypeAlias = (
     Literal[
+        "gpt-realtime",
+        "gpt-realtime-1.5",
+        "gpt-realtime-2",
+        "gpt-realtime-2025-08-28",
         "gpt-4o-realtime-preview",
-        "gpt-4o-mini-realtime-preview",
-        "gpt-4o-realtime-preview-2025-06-03",
-        "gpt-4o-realtime-preview-2024-12-17",
         "gpt-4o-realtime-preview-2024-10-01",
+        "gpt-4o-realtime-preview-2024-12-17",
+        "gpt-4o-realtime-preview-2025-06-03",
+        "gpt-4o-mini-realtime-preview",
         "gpt-4o-mini-realtime-preview-2024-12-17",
-    ],
-    str,
-]
+        "gpt-realtime-mini",
+        "gpt-realtime-mini-2025-10-06",
+        "gpt-realtime-mini-2025-12-15",
+    ]
+    | str
+)
 """The name of a realtime model."""
 
 
-RealtimeAudioFormat: TypeAlias = Union[Literal["pcm16", "g711_ulaw", "g711_alaw"], str]
+RealtimeAudioFormat: TypeAlias = (
+    Literal["pcm16", "g711_ulaw", "g711_alaw"]
+    | str
+    | Mapping[str, Any]
+    | OpenAIRealtimeAudioFormats
+)
 """The audio format for realtime audio streams."""
+
+
+class RealtimeCustomVoice(TypedDict):
+    """A custom Realtime voice object."""
+
+    id: str
+    """The custom voice ID."""
+
+
+RealtimeVoice: TypeAlias = str | RealtimeCustomVoice | Mapping[str, Any]
+"""The voice to use for realtime audio output."""
+
+
+RealtimeReasoningEffort: TypeAlias = Literal["minimal", "low", "medium", "high", "xhigh"] | str
+"""The reasoning effort for realtime model responses."""
 
 
 class RealtimeClientMessage(TypedDict):
@@ -52,6 +82,13 @@ class RealtimeInputAudioTranscriptionConfig(TypedDict):
 
     prompt: NotRequired[str]
     """An optional prompt to guide transcription."""
+
+
+class RealtimeInputAudioNoiseReductionConfig(TypedDict):
+    """Noise reduction configuration for input audio."""
+
+    type: NotRequired[Literal["near_field", "far_field"]]
+    """Noise reduction mode to apply to input audio."""
 
 
 class RealtimeTurnDetectionConfig(TypedDict):
@@ -81,6 +118,40 @@ class RealtimeTurnDetectionConfig(TypedDict):
     idle_timeout_ms: NotRequired[int]
     """Threshold for server-vad to trigger a response if the user is idle for this duration."""
 
+    model_version: NotRequired[str]
+    """Optional backend-specific VAD model identifier."""
+
+
+class RealtimeAudioInputConfig(TypedDict, total=False):
+    """Configuration for audio input in realtime sessions."""
+
+    format: RealtimeAudioFormat | OpenAIRealtimeAudioFormats
+    noise_reduction: RealtimeInputAudioNoiseReductionConfig | None
+    transcription: RealtimeInputAudioTranscriptionConfig
+    turn_detection: RealtimeTurnDetectionConfig
+
+
+class RealtimeAudioOutputConfig(TypedDict, total=False):
+    """Configuration for audio output in realtime sessions."""
+
+    format: RealtimeAudioFormat | OpenAIRealtimeAudioFormats
+    voice: RealtimeVoice
+    speed: float
+
+
+class RealtimeAudioConfig(TypedDict, total=False):
+    """Audio configuration for realtime sessions."""
+
+    input: RealtimeAudioInputConfig
+    output: RealtimeAudioOutputConfig
+
+
+class RealtimeReasoningConfig(TypedDict, total=False):
+    """Reasoning configuration for realtime sessions."""
+
+    effort: RealtimeReasoningEffort
+    """The reasoning effort to use for realtime model responses."""
+
 
 class RealtimeSessionModelSettings(TypedDict):
     """Model settings for a realtime model session."""
@@ -91,29 +162,54 @@ class RealtimeSessionModelSettings(TypedDict):
     instructions: NotRequired[str]
     """System instructions for the model."""
 
+    prompt: NotRequired[Prompt]
+    """The prompt to use for the model."""
+
     modalities: NotRequired[list[Literal["text", "audio"]]]
     """The modalities the model should support."""
 
-    voice: NotRequired[str]
+    output_modalities: NotRequired[list[Literal["text", "audio"]]]
+    """The output modalities the model should support."""
+
+    audio: NotRequired[RealtimeAudioConfig]
+    """The audio configuration for the session."""
+
+    voice: NotRequired[RealtimeVoice]
     """The voice to use for audio output."""
 
     speed: NotRequired[float]
     """The speed of the model's responses."""
 
-    input_audio_format: NotRequired[RealtimeAudioFormat]
+    max_output_tokens: NotRequired[int | Literal["inf"]]
+    """Maximum number of output tokens for a single assistant response, inclusive of tool calls.
+
+    Provide an integer between 1 and 4096 to limit output tokens, or ``"inf"`` for the maximum
+    available tokens for a given model. Defaults to ``"inf"`` server-side.
+    """
+
+    input_audio_format: NotRequired[RealtimeAudioFormat | OpenAIRealtimeAudioFormats]
     """The format for input audio streams."""
 
-    output_audio_format: NotRequired[RealtimeAudioFormat]
+    output_audio_format: NotRequired[RealtimeAudioFormat | OpenAIRealtimeAudioFormats]
     """The format for output audio streams."""
 
     input_audio_transcription: NotRequired[RealtimeInputAudioTranscriptionConfig]
     """Configuration for transcribing input audio."""
+
+    input_audio_noise_reduction: NotRequired[RealtimeInputAudioNoiseReductionConfig | None]
+    """Noise reduction configuration for input audio."""
 
     turn_detection: NotRequired[RealtimeTurnDetectionConfig]
     """Configuration for detecting conversation turns."""
 
     tool_choice: NotRequired[ToolChoice]
     """How the model should choose which tools to call."""
+
+    parallel_tool_calls: NotRequired[bool]
+    """Whether the model may make parallel tool calls."""
+
+    reasoning: NotRequired[RealtimeReasoningConfig]
+    """Reasoning configuration for realtime model responses."""
 
     tools: NotRequired[list[Tool]]
     """List of tools available to the model."""
@@ -133,6 +229,16 @@ class RealtimeGuardrailsSettings(TypedDict):
     The minimum number of characters to accumulate before running guardrails on transcript
     deltas. Defaults to 100. Guardrails run every time the accumulated text reaches
     1x, 2x, 3x, etc. times this threshold.
+    """
+
+
+class RealtimeToolExecutionConfig(TypedDict):
+    """SDK-side execution settings for local realtime tool calls."""
+
+    pre_approval_tool_input_guardrails: NotRequired[bool]
+    """Run function tool input guardrails before emitting a pending approval event.
+
+    The same guardrails still run again immediately before tool execution after approval.
     """
 
 
@@ -164,6 +270,15 @@ class RealtimeRunConfig(TypedDict):
     tracing_disabled: NotRequired[bool]
     """Whether tracing is disabled for this run."""
 
+    async_tool_calls: NotRequired[bool]
+    """Whether function tool calls should run asynchronously. Defaults to True."""
+
+    tool_execution: NotRequired[RealtimeToolExecutionConfig]
+    """SDK-side execution settings for local realtime tool calls."""
+
+    tool_error_formatter: NotRequired[ToolErrorFormatter]
+    """Optional callback that formats tool error messages returned to the model."""
+
     # TODO (rm) Add history audio storage config
 
 
@@ -177,6 +292,14 @@ class RealtimeUserInputText(TypedDict):
     """The text content from the user."""
 
 
+class RealtimeUserInputImage(TypedDict, total=False):
+    """An image input from the user (Realtime)."""
+
+    type: Literal["input_image"]
+    image_url: str
+    detail: NotRequired[Literal["auto", "low", "high"] | str]
+
+
 class RealtimeUserInputMessage(TypedDict):
     """A message input from the user."""
 
@@ -186,9 +309,9 @@ class RealtimeUserInputMessage(TypedDict):
     role: Literal["user"]
     """The role identifier for user messages."""
 
-    content: list[RealtimeUserInputText]
-    """List of text content items in the message."""
+    content: list[RealtimeUserInputText | RealtimeUserInputImage]
+    """List of content items (text and image) in the message."""
 
 
-RealtimeUserInput: TypeAlias = Union[str, RealtimeUserInputMessage]
+RealtimeUserInput: TypeAlias = str | RealtimeUserInputMessage
 """User input that can be a string or structured message."""

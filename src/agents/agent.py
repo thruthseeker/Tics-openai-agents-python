@@ -3,36 +3,71 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, cast
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, cast
 
 from openai.types.responses.response_prompt_param import ResponsePromptParam
-from typing_extensions import NotRequired, TypeAlias, TypedDict
+from pydantic import BaseModel, TypeAdapter, ValidationError
+from typing_extensions import NotRequired, TypedDict
 
+from ._tool_identity import get_function_tool_approval_keys
 from .agent_output import AgentOutputSchemaBase
+from .agent_tool_input import (
+    AgentAsToolInput,
+    StructuredToolInputBuilder,
+    build_structured_input_schema_info,
+    resolve_agent_tool_input,
+)
+from .agent_tool_state import (
+    consume_agent_tool_run_result,
+    get_agent_tool_state_scope,
+    peek_agent_tool_run_result,
+    record_agent_tool_run_result,
+    set_agent_tool_state_scope,
+)
+from .exceptions import ModelBehaviorError, UserError
 from .guardrail import InputGuardrail, OutputGuardrail
 from .handoffs import Handoff
-from .items import ItemHelpers
 from .logger import logger
 from .mcp import MCPUtil
 from .model_settings import ModelSettings
 from .models.default_models import (
     get_default_model_settings,
-    gpt_5_reasoning_settings_required,
-    is_gpt_5_default,
 )
 from .models.interface import Model
 from .prompts import DynamicPromptFunction, Prompt, PromptUtil
 from .run_context import RunContextWrapper, TContext
-from .tool import FunctionTool, FunctionToolResult, Tool, function_tool
+from .strict_schema import ensure_strict_json_schema
+from .tool import (
+    FunctionTool,
+    FunctionToolResult,
+    Tool,
+    ToolErrorFunction,
+    ToolOrigin,
+    ToolOriginType,
+    _build_handled_function_tool_error_handler,
+    _build_wrapped_function_tool,
+    _log_function_tool_invocation,
+    _parse_function_tool_json_input,
+    default_tool_error_function,
+    prune_orphaned_tool_search_tools,
+)
+from .tool_context import ToolContext
 from .util import _transforms
 from .util._types import MaybeAwaitable
 
 if TYPE_CHECKING:
-    from .lifecycle import AgentHooks
+    from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+
+    from .items import ToolApprovalItem
+    from .lifecycle import AgentHooks, RunHooks
     from .mcp import MCPServer
-    from .result import RunResult
+    from .memory.session import Session
+    from .result import RunResult, RunResultStreaming
+    from .run import RunConfig
+    from .run_state import RunState
+    from .stream_events import StreamEvent
 
 
 @dataclass
@@ -57,6 +92,45 @@ ToolsToFinalOutputFunction: TypeAlias = Callable[
 """
 
 
+def _validate_codex_tool_name_collisions(tools: list[Tool]) -> None:
+    codex_tool_names = {
+        tool.name
+        for tool in tools
+        if isinstance(tool, FunctionTool) and bool(getattr(tool, "_is_codex_tool", False))
+    }
+    if not codex_tool_names:
+        return
+
+    name_counts: dict[str, int] = {}
+    for tool in tools:
+        tool_name = getattr(tool, "name", None)
+        if isinstance(tool_name, str) and tool_name:
+            name_counts[tool_name] = name_counts.get(tool_name, 0) + 1
+
+    duplicate_codex_names = sorted(
+        name for name in codex_tool_names if name_counts.get(name, 0) > 1
+    )
+    if duplicate_codex_names:
+        raise UserError(
+            "Duplicate Codex tool names found: "
+            + ", ".join(duplicate_codex_names)
+            + ". Provide a unique codex_tool(name=...) per tool instance."
+        )
+
+
+class AgentToolStreamEvent(TypedDict):
+    """Streaming event emitted when an agent is invoked as a tool."""
+
+    event: StreamEvent
+    """The streaming event from the nested agent run."""
+
+    agent: Agent[Any]
+    """The nested agent emitting the event."""
+
+    tool_call: ResponseFunctionToolCall | None
+    """The originating tool call, if available."""
+
+
 class StopAtTools(TypedDict):
     stop_at_tool_names: list[str]
     """A list of tool names, any of which will stop the agent from running further."""
@@ -69,6 +143,31 @@ class MCPConfig(TypedDict):
     """If True, we will attempt to convert the MCP schemas to strict-mode schemas. This is a
     best-effort conversion, so some schemas may not be convertible. Defaults to False.
     """
+
+    failure_error_function: NotRequired[ToolErrorFunction | None]
+    """Optional function to convert MCP tool failures into model-visible messages. If explicitly
+    set to None, tool errors will be raised instead. If unset, defaults to
+    default_tool_error_function.
+    """
+
+    include_server_in_tool_names: NotRequired[bool]
+    """If True, local MCP tools are exposed with server-prefixed public names to avoid name
+    collisions across multiple MCP servers. Defaults to False.
+    """
+
+
+def _initial_model_settings_for_model(model: str | Model | None) -> ModelSettings:
+    if model is None:
+        return get_default_model_settings()
+    if isinstance(model, str):
+        return get_default_model_settings(model)
+    return ModelSettings()
+
+
+def _model_settings_match_implicit_model_defaults(
+    model: str | Model | None, model_settings: ModelSettings
+) -> bool:
+    return model_settings == _initial_model_settings_for_model(model)
 
 
 @dataclass
@@ -93,17 +192,55 @@ class AgentBase(Generic[TContext]):
 
     NOTE: You are expected to manage the lifecycle of these servers. Specifically, you must call
     `server.connect()` before passing it to the agent, and `server.cleanup()` when the server is no
-    longer needed.
+    longer needed. Consider using `MCPServerManager` from `agents.mcp` to keep connect/cleanup
+    in the same task.
     """
 
     mcp_config: MCPConfig = field(default_factory=lambda: MCPConfig())
     """Configuration for MCP servers."""
 
+    async def _get_mcp_tool_reserved_names(
+        self, run_context: RunContextWrapper[TContext]
+    ) -> set[str]:
+        reserved_tool_names = {tool.name for tool in self.tools if isinstance(tool, FunctionTool)}
+
+        async def _check_handoff_enabled(handoff_obj: Handoff[Any, Any]) -> bool:
+            attr = handoff_obj.is_enabled
+            if isinstance(attr, bool):
+                return attr
+            res = attr(run_context, self)
+            if inspect.isawaitable(res):
+                return bool(await res)
+            return bool(res)
+
+        for handoff_item in getattr(self, "handoffs", ()):
+            if isinstance(handoff_item, Handoff):
+                if await _check_handoff_enabled(handoff_item):
+                    reserved_tool_names.add(handoff_item.tool_name)
+            elif isinstance(handoff_item, AgentBase):
+                reserved_tool_names.add(Handoff.default_tool_name(handoff_item))
+        return reserved_tool_names
+
     async def get_mcp_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
         """Fetches the available tools from the MCP servers."""
         convert_schemas_to_strict = self.mcp_config.get("convert_schemas_to_strict", False)
+        failure_error_function = self.mcp_config.get(
+            "failure_error_function", default_tool_error_function
+        )
+        include_server_in_tool_names = self.mcp_config.get("include_server_in_tool_names", False)
+        reserved_tool_names = (
+            await self._get_mcp_tool_reserved_names(run_context)
+            if include_server_in_tool_names
+            else None
+        )
         return await MCPUtil.get_all_function_tools(
-            self.mcp_servers, convert_schemas_to_strict, run_context, self
+            self.mcp_servers,
+            convert_schemas_to_strict,
+            run_context,
+            self,
+            failure_error_function=failure_error_function,
+            include_server_in_tool_names=include_server_in_tool_names,
+            reserved_tool_names=reserved_tool_names,
         )
 
     async def get_all_tools(self, run_context: RunContextWrapper[TContext]) -> list[Tool]:
@@ -123,8 +260,10 @@ class AgentBase(Generic[TContext]):
             return bool(res)
 
         results = await asyncio.gather(*(_check_tool_enabled(t) for t in self.tools))
-        enabled: list[Tool] = [t for t, ok in zip(self.tools, results) if ok]
-        return [*mcp_tools, *enabled]
+        enabled: list[Tool] = [t for t, ok in zip(self.tools, results, strict=False) if ok]
+        all_tools: list[Tool] = prune_orphaned_tool_search_tools([*mcp_tools, *enabled])
+        _validate_codex_tool_name_collisions(all_tools)
+        return all_tools
 
 
 @dataclass
@@ -173,7 +312,7 @@ class Agent(AgentBase, Generic[TContext]):
     """The model implementation to use when invoking the LLM.
 
     By default, if not set, the agent will use the default model configured in
-    `agents.models.get_default_model()` (currently "gpt-4.1").
+    `agents.models.get_default_model()` (currently "gpt-5.4-mini").
     """
 
     model_settings: ModelSettings = field(default_factory=get_default_model_settings)
@@ -291,25 +430,8 @@ class Agent(AgentBase, Generic[TContext]):
                 f"got {type(self.model_settings).__name__}"
             )
 
-        if (
-            # The user sets a non-default model
-            self.model is not None
-            and (
-                # The default model is gpt-5
-                is_gpt_5_default() is True
-                # However, the specified model is not a gpt-5 model
-                and (
-                    isinstance(self.model, str) is False
-                    or gpt_5_reasoning_settings_required(self.model) is False  # type: ignore
-                )
-                # The model settings are not customized for the specified model
-                and self.model_settings == get_default_model_settings()
-            )
-        ):
-            # In this scenario, we should use a generic model settings
-            # because non-gpt-5 models are not compatible with the default gpt-5 model settings.
-            # This is a best-effort attempt to make the agent work with non-gpt-5 models.
-            self.model_settings = ModelSettings()
+        if self.model is not None and self.model_settings == get_default_model_settings():
+            self.model_settings = _initial_model_settings_for_model(self.model)
 
         if not isinstance(self.input_guardrails, list):
             raise TypeError(
@@ -326,7 +448,7 @@ class Agent(AgentBase, Generic[TContext]):
             from .agent_output import AgentOutputSchemaBase
 
             if not (
-                isinstance(self.output_type, (type, AgentOutputSchemaBase))
+                isinstance(self.output_type, type | AgentOutputSchemaBase)
                 or get_origin(self.output_type) is not None
             ):
                 raise TypeError(
@@ -375,16 +497,37 @@ class Agent(AgentBase, Generic[TContext]):
             new_agent = agent.clone(instructions="New instructions")
             ```
         """
+        if (
+            "model" in kwargs
+            and "model_settings" not in kwargs
+            and _model_settings_match_implicit_model_defaults(self.model, self.model_settings)
+        ):
+            kwargs["model_settings"] = _initial_model_settings_for_model(kwargs["model"])
         return dataclasses.replace(self, **kwargs)
 
     def as_tool(
         self,
         tool_name: str | None,
         tool_description: str | None,
-        custom_output_extractor: Callable[[RunResult], Awaitable[str]] | None = None,
+        custom_output_extractor: (
+            Callable[[RunResult | RunResultStreaming], Awaitable[str]] | None
+        ) = None,
         is_enabled: bool
         | Callable[[RunContextWrapper[Any], AgentBase[Any]], MaybeAwaitable[bool]] = True,
-    ) -> Tool:
+        on_stream: Callable[[AgentToolStreamEvent], MaybeAwaitable[None]] | None = None,
+        run_config: RunConfig | None = None,
+        max_turns: int | None = None,
+        hooks: RunHooks[TContext] | None = None,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
+        session: Session | None = None,
+        failure_error_function: ToolErrorFunction | None = default_tool_error_function,
+        needs_approval: bool
+        | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]] = False,
+        parameters: type[Any] | None = None,
+        input_builder: StructuredToolInputBuilder | None = None,
+        include_input_schema: bool = False,
+    ) -> FunctionTool:
         """Transform this agent into a tool, callable by other agents.
 
         This is different from handoffs in two ways:
@@ -398,31 +541,399 @@ class Agent(AgentBase, Generic[TContext]):
             tool_description: The description of the tool, which should indicate what it does and
                 when to use it.
             custom_output_extractor: A function that extracts the output from the agent. If not
-                provided, the last message from the agent will be used.
+                provided, the last message from the agent will be used. Nested run results expose
+                `agent_tool_invocation` metadata when this agent is invoked via `as_tool()`.
             is_enabled: Whether the tool is enabled. Can be a bool or a callable that takes the run
                 context and agent and returns whether the tool is enabled. Disabled tools are hidden
                 from the LLM at runtime.
+            on_stream: Optional callback (sync or async) to receive streaming events from the nested
+                agent run. The callback receives an `AgentToolStreamEvent` containing the nested
+                agent, the originating tool call (when available), and each stream event. When
+                provided, the nested agent is executed in streaming mode.
+            failure_error_function: If provided, generate an error message when the tool (agent) run
+                fails. The message is sent to the LLM. If None, the exception is raised instead.
+            needs_approval: Bool or callable to decide if this agent tool should pause for approval.
+            parameters: Structured input type for the tool arguments (dataclass or Pydantic model).
+            input_builder: Optional function to build the nested agent input from structured data.
+            include_input_schema: Whether to include the full JSON schema in structured input.
         """
 
-        @function_tool(
-            name_override=tool_name or _transforms.transform_string_function_style(self.name),
-            description_override=tool_description or "",
-            is_enabled=is_enabled,
+        def _is_supported_parameters(value: Any) -> bool:
+            if not isinstance(value, type):
+                return False
+            if dataclasses.is_dataclass(value):
+                return True
+            return issubclass(value, BaseModel)
+
+        tool_name_resolved = tool_name or _transforms.transform_string_function_style(self.name)
+        tool_description_resolved = tool_description or ""
+        has_custom_parameters = parameters is not None
+        include_schema = bool(include_input_schema and has_custom_parameters)
+        should_capture_tool_input = bool(
+            has_custom_parameters or include_schema or input_builder is not None
         )
-        async def run_agent(context: RunContextWrapper, input: str) -> str:
-            from .run import Runner
 
-            output = await Runner.run(
-                starting_agent=self,
-                input=input,
-                context=context.context,
+        if parameters is None:
+            params_adapter = TypeAdapter(AgentAsToolInput)
+            params_schema = ensure_strict_json_schema(params_adapter.json_schema())
+        else:
+            if not _is_supported_parameters(parameters):
+                raise TypeError("Agent tool parameters must be a dataclass or Pydantic model type.")
+            params_adapter = TypeAdapter(parameters)
+            params_schema = ensure_strict_json_schema(params_adapter.json_schema())
+
+        schema_info = build_structured_input_schema_info(
+            params_schema,
+            include_json_schema=include_schema,
+        )
+
+        def _normalize_tool_input(parsed: Any, tool_name: str) -> Any:
+            # Prefer JSON mode so structured params (datetime/UUID/Decimal, etc.) serialize cleanly.
+            try:
+                return params_adapter.dump_python(parsed, mode="json")
+            except Exception as exc:
+                raise ModelBehaviorError(
+                    f"Failed to serialize structured tool input for {tool_name}: {exc}"
+                ) from exc
+
+        async def _run_agent_impl(context: ToolContext, input_json: str) -> Any:
+            from .run import DEFAULT_MAX_TURNS, Runner
+            from .tool_context import ToolContext
+
+            tool_name = (
+                context.tool_name if isinstance(context, ToolContext) else tool_name_resolved
             )
+            json_data = _parse_function_tool_json_input(
+                tool_name=tool_name,
+                input_json=input_json,
+            )
+            _log_function_tool_invocation(tool_name=tool_name, input_json=input_json)
+
+            try:
+                parsed_params = params_adapter.validate_python(json_data)
+            except ValidationError as exc:
+                raise ModelBehaviorError(f"Invalid JSON input for tool {tool_name}: {exc}") from exc
+
+            params_data = _normalize_tool_input(parsed_params, tool_name)
+            resolved_input = await resolve_agent_tool_input(
+                params=params_data,
+                schema_info=schema_info if should_capture_tool_input else None,
+                input_builder=input_builder,
+            )
+            if not isinstance(resolved_input, str) and not isinstance(resolved_input, list):
+                raise ModelBehaviorError("Agent tool called with invalid input")
+
+            resolved_max_turns = max_turns if max_turns is not None else DEFAULT_MAX_TURNS
+            resolved_run_config = run_config
+            if resolved_run_config is None and isinstance(context, ToolContext):
+                resolved_run_config = context.run_config
+            tool_state_scope_id = get_agent_tool_state_scope(context)
+            if isinstance(context, ToolContext):
+                # Use a fresh ToolContext to avoid sharing approval state with parent runs.
+                nested_context = ToolContext(
+                    context=context.context,
+                    usage=context.usage,
+                    tool_name=context.tool_name,
+                    tool_call_id=context.tool_call_id,
+                    tool_arguments=context.tool_arguments,
+                    tool_call=context.tool_call,
+                    tool_namespace=context.tool_namespace,
+                    agent=context.agent,
+                    run_config=resolved_run_config,
+                )
+                set_agent_tool_state_scope(nested_context, tool_state_scope_id)
+                if should_capture_tool_input:
+                    nested_context.tool_input = params_data
+            elif isinstance(context, RunContextWrapper):
+                if should_capture_tool_input:
+                    nested_context = RunContextWrapper(context=context.context)
+                    set_agent_tool_state_scope(nested_context, tool_state_scope_id)
+                    nested_context.tool_input = params_data
+                else:
+                    nested_context = context.context
+            else:
+                if should_capture_tool_input:
+                    nested_context = RunContextWrapper(context=context)
+                    set_agent_tool_state_scope(nested_context, tool_state_scope_id)
+                    nested_context.tool_input = params_data
+                else:
+                    nested_context = context
+            run_result: RunResult | RunResultStreaming | None = None
+            resume_state: RunState | None = None
+            should_record_run_result = True
+
+            def _nested_approvals_status(
+                interruptions: list[ToolApprovalItem],
+            ) -> Literal["approved", "pending", "rejected"]:
+                has_pending = False
+                has_decision = False
+                for interruption in interruptions:
+                    call_id = interruption.call_id
+                    if not call_id:
+                        has_pending = True
+                        continue
+                    tool_namespace = RunContextWrapper._resolve_tool_namespace(interruption)
+                    status = context.get_approval_status(
+                        interruption.tool_name or "",
+                        call_id,
+                        tool_namespace=tool_namespace,
+                        existing_pending=interruption,
+                    )
+                    if status is False:
+                        return "rejected"
+                    if status is True:
+                        has_decision = True
+                    if status is None:
+                        has_pending = True
+                if has_decision:
+                    return "approved"
+                if has_pending:
+                    return "pending"
+                return "approved"
+
+            def _apply_nested_approvals(
+                nested_context: RunContextWrapper[Any],
+                parent_context: RunContextWrapper[Any],
+                interruptions: list[ToolApprovalItem],
+            ) -> None:
+                def _find_mirrored_approval_record(
+                    interruption: ToolApprovalItem,
+                    *,
+                    approved: bool,
+                ) -> Any | None:
+                    candidate_keys = list(RunContextWrapper._resolve_approval_keys(interruption))
+                    for candidate_key in get_function_tool_approval_keys(
+                        tool_name=RunContextWrapper._resolve_tool_name(interruption),
+                        tool_namespace=RunContextWrapper._resolve_tool_namespace(interruption),
+                        tool_lookup_key=RunContextWrapper._resolve_tool_lookup_key(interruption),
+                        include_legacy_deferred_key=True,
+                    ):
+                        if candidate_key not in candidate_keys:
+                            candidate_keys.append(candidate_key)
+                    fallback: Any | None = None
+                    for candidate_key in candidate_keys:
+                        candidate = parent_context._approvals.get(candidate_key)
+                        if candidate is None:
+                            continue
+                        if approved and candidate.approved is True:
+                            return candidate
+                        if not approved and candidate.rejected is True:
+                            return candidate
+                        if fallback is None:
+                            fallback = candidate
+                    return fallback
+
+                for interruption in interruptions:
+                    call_id = interruption.call_id
+                    if not call_id:
+                        continue
+                    tool_name = RunContextWrapper._resolve_tool_name(interruption)
+                    tool_namespace = RunContextWrapper._resolve_tool_namespace(interruption)
+                    approval_key = RunContextWrapper._resolve_approval_key(interruption)
+                    status = parent_context.get_approval_status(
+                        tool_name,
+                        call_id,
+                        tool_namespace=tool_namespace,
+                        existing_pending=interruption,
+                    )
+                    if status is None:
+                        continue
+                    approval_record = parent_context._approvals.get(approval_key)
+                    if approval_record is None:
+                        approval_record = _find_mirrored_approval_record(
+                            interruption,
+                            approved=status,
+                        )
+                    if status is True:
+                        always_approve = bool(approval_record and approval_record.approved is True)
+                        nested_context.approve_tool(
+                            interruption,
+                            always_approve=always_approve,
+                        )
+                    else:
+                        always_reject = bool(approval_record and approval_record.rejected is True)
+                        nested_context.reject_tool(
+                            interruption,
+                            always_reject=always_reject,
+                        )
+
+            if isinstance(context, ToolContext) and context.tool_call is not None:
+                pending_run_result = peek_agent_tool_run_result(
+                    context.tool_call,
+                    scope_id=tool_state_scope_id,
+                )
+                if pending_run_result and getattr(pending_run_result, "interruptions", None):
+                    status = _nested_approvals_status(pending_run_result.interruptions)
+                    if status == "pending":
+                        run_result = pending_run_result
+                        should_record_run_result = False
+                    elif status in ("approved", "rejected"):
+                        resume_state = pending_run_result.to_state()
+                        if resume_state._context is not None:
+                            # Apply only explicit parent approvals to the nested resumed run.
+                            _apply_nested_approvals(
+                                resume_state._context,
+                                context,
+                                pending_run_result.interruptions,
+                            )
+                        consume_agent_tool_run_result(
+                            context.tool_call,
+                            scope_id=tool_state_scope_id,
+                        )
+
+            if run_result is None:
+                if on_stream is not None:
+                    stream_handler = on_stream
+                    run_result_streaming = Runner.run_streamed(
+                        starting_agent=cast(Agent[Any], self),
+                        input=resume_state or resolved_input,
+                        context=None if resume_state is not None else cast(Any, nested_context),
+                        run_config=resolved_run_config,
+                        max_turns=resolved_max_turns,
+                        hooks=hooks,
+                        previous_response_id=None
+                        if resume_state is not None
+                        else previous_response_id,
+                        conversation_id=None if resume_state is not None else conversation_id,
+                        session=session,
+                    )
+                    # Dispatch callbacks in the background so slow handlers do not block
+                    # event consumption.
+                    event_queue: asyncio.Queue[AgentToolStreamEvent | None] = asyncio.Queue()
+
+                    async def _run_handler(payload: AgentToolStreamEvent) -> None:
+                        """Execute the user callback while capturing exceptions."""
+                        try:
+                            maybe_result = stream_handler(payload)
+                            if inspect.isawaitable(maybe_result):
+                                await maybe_result
+                        except Exception:
+                            logger.exception(
+                                "Error while handling on_stream event for agent tool %s.",
+                                self.name,
+                            )
+
+                    async def dispatch_stream_events() -> None:
+                        while True:
+                            payload = await event_queue.get()
+                            is_sentinel = payload is None  # None marks the end of the stream.
+                            try:
+                                if payload is not None:
+                                    await _run_handler(payload)
+                            finally:
+                                event_queue.task_done()
+
+                            if is_sentinel:
+                                break
+
+                    dispatch_task = asyncio.create_task(dispatch_stream_events())
+                    stream_iteration_cancelled = False
+
+                    try:
+                        from .stream_events import AgentUpdatedStreamEvent
+
+                        current_agent = run_result_streaming.current_agent
+                        try:
+                            async for event in run_result_streaming.stream_events():
+                                if isinstance(event, AgentUpdatedStreamEvent):
+                                    current_agent = event.new_agent
+
+                                payload: AgentToolStreamEvent = {
+                                    "event": event,
+                                    "agent": current_agent,
+                                    "tool_call": context.tool_call,
+                                }
+                                await event_queue.put(payload)
+                        except asyncio.CancelledError:
+                            stream_iteration_cancelled = True
+                            raise
+                    finally:
+                        if stream_iteration_cancelled:
+                            dispatch_task.cancel()
+                            try:
+                                await dispatch_task
+                            except asyncio.CancelledError:
+                                pass
+                        else:
+                            await event_queue.put(None)
+                            await event_queue.join()
+                            await dispatch_task
+                    run_result = run_result_streaming
+                else:
+                    run_result = await Runner.run(
+                        starting_agent=cast(Agent[Any], self),
+                        input=resume_state or resolved_input,
+                        context=None if resume_state is not None else cast(Any, nested_context),
+                        run_config=resolved_run_config,
+                        max_turns=resolved_max_turns,
+                        hooks=hooks,
+                        previous_response_id=None
+                        if resume_state is not None
+                        else previous_response_id,
+                        conversation_id=None if resume_state is not None else conversation_id,
+                        session=session,
+                    )
+            assert run_result is not None
+
+            # Store the run result by tool call identity so nested interruptions can be read later.
+            interruptions = getattr(run_result, "interruptions", None)
+            if isinstance(context, ToolContext) and context.tool_call is not None and interruptions:
+                if should_record_run_result:
+                    record_agent_tool_run_result(
+                        context.tool_call,
+                        run_result,
+                        scope_id=tool_state_scope_id,
+                    )
+
             if custom_output_extractor:
-                return await custom_output_extractor(output)
+                return await custom_output_extractor(run_result)
 
-            return ItemHelpers.text_message_outputs(output.new_items)
+            if run_result.final_output is not None and (
+                not isinstance(run_result.final_output, str) or run_result.final_output != ""
+            ):
+                return run_result.final_output
 
-        return run_agent
+            from .items import ItemHelpers, MessageOutputItem, ToolCallOutputItem
+
+            for item in reversed(run_result.new_items):
+                if isinstance(item, MessageOutputItem):
+                    text_output = ItemHelpers.text_message_output(item)
+                    if text_output:
+                        return text_output
+
+                if (
+                    isinstance(item, ToolCallOutputItem)
+                    and isinstance(item.output, str)
+                    and item.output
+                ):
+                    return item.output
+
+            return run_result.final_output
+
+        run_agent_tool = _build_wrapped_function_tool(
+            name=tool_name_resolved,
+            description=tool_description_resolved,
+            params_json_schema=params_schema,
+            invoke_tool_impl=_run_agent_impl,
+            on_handled_error=_build_handled_function_tool_error_handler(
+                span_message="Error running tool (non-fatal)",
+                span_message_for_json_decode_error="Error running tool",
+                log_label="Tool",
+            ),
+            failure_error_function=failure_error_function,
+            strict_json_schema=True,
+            is_enabled=is_enabled,
+            needs_approval=needs_approval,
+            tool_origin=ToolOrigin(
+                type=ToolOriginType.AGENT_AS_TOOL,
+                agent_name=self.name,
+                agent_tool_name=tool_name_resolved,
+            ),
+        )
+        run_agent_tool._is_agent_tool = True
+        run_agent_tool._agent_instance = self
+
+        return run_agent_tool
 
     async def get_system_prompt(self, run_context: RunContextWrapper[TContext]) -> str | None:
         if isinstance(self.instructions, str):
@@ -457,4 +968,10 @@ class Agent(AgentBase, Generic[TContext]):
         self, run_context: RunContextWrapper[TContext]
     ) -> ResponsePromptParam | None:
         """Get the prompt for the agent."""
-        return await PromptUtil.to_model_input(self.prompt, run_context, self)
+        from ._public_agent import get_public_agent
+
+        return await PromptUtil.to_model_input(
+            self.prompt,
+            run_context,
+            cast(Agent[TContext], get_public_agent(self)),
+        )

@@ -6,6 +6,7 @@ from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
+    ResponseOutputRefusal,
     ResponseOutputText,
 )
 
@@ -31,7 +32,17 @@ def get_text_message(content: str) -> ResponseOutputItem:
         id="1",
         type="message",
         role="assistant",
-        content=[ResponseOutputText(text=content, type="output_text", annotations=[])],
+        content=[ResponseOutputText(text=content, type="output_text", annotations=[], logprobs=[])],
+        status="completed",
+    )
+
+
+def get_refusal_message(refusal: str) -> ResponseOutputItem:
+    return ResponseOutputMessage(
+        id="1",
+        type="message",
+        role="assistant",
+        content=[ResponseOutputRefusal(refusal=refusal, type="refusal")],
         status="completed",
     )
 
@@ -50,15 +61,22 @@ def get_function_tool(
 
 
 def get_function_tool_call(
-    name: str, arguments: str | None = None, call_id: str | None = None
+    name: str,
+    arguments: str | None = None,
+    call_id: str | None = None,
+    *,
+    namespace: str | None = None,
 ) -> ResponseOutputItem:
-    return ResponseFunctionToolCall(
-        id="1",
-        call_id=call_id or "2",
-        type="function_call",
-        name=name,
-        arguments=arguments or "",
-    )
+    kwargs: dict[str, Any] = {
+        "id": "1",
+        "call_id": call_id or "2",
+        "type": "function_call",
+        "name": name,
+        "arguments": arguments or "",
+    }
+    if namespace is not None:
+        kwargs["namespace"] = namespace
+    return ResponseFunctionToolCall(**kwargs)
 
 
 def get_handoff_tool_call(
@@ -73,6 +91,6 @@ def get_final_output_message(args: str) -> ResponseOutputItem:
         id="1",
         type="message",
         role="assistant",
-        content=[ResponseOutputText(text=args, type="output_text", annotations=[])],
+        content=[ResponseOutputText(text=args, type="output_text", annotations=[], logprobs=[])],
         status="completed",
     )

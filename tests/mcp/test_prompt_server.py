@@ -1,9 +1,10 @@
 from typing import Any
 
 import pytest
+from mcp.types import ListResourcesResult, ListResourceTemplatesResult, ReadResourceResult
 
 from agents import Agent, Runner
-from agents.mcp import MCPServer
+from agents.mcp import MCPServer, MCPToolMetaResolver
 
 from ..fake_model import FakeModel
 from ..test_responses import get_text_message
@@ -12,7 +13,12 @@ from ..test_responses import get_text_message
 class FakeMCPPromptServer(MCPServer):
     """Fake MCP server for testing prompt functionality"""
 
-    def __init__(self, server_name: str = "fake_prompt_server"):
+    def __init__(
+        self,
+        server_name: str = "fake_prompt_server",
+        tool_meta_resolver: MCPToolMetaResolver | None = None,
+    ):
+        super().__init__(tool_meta_resolver=tool_meta_resolver)
         self.prompts: list[Any] = []
         self.prompt_results: dict[str, str] = {}
         self._server_name = server_name
@@ -63,8 +69,24 @@ class FakeMCPPromptServer(MCPServer):
     async def list_tools(self, run_context=None, agent=None):
         return []
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None = None):
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ):
         raise NotImplementedError("This fake server doesn't support tools")
+
+    async def list_resources(self, cursor: str | None = None) -> ListResourcesResult:
+        return ListResourcesResult(resources=[])
+
+    async def list_resource_templates(
+        self, cursor: str | None = None
+    ) -> ListResourceTemplatesResult:
+        return ListResourceTemplatesResult(resourceTemplates=[])
+
+    async def read_resource(self, uri: str) -> ReadResourceResult:
+        return ReadResourceResult(contents=[])
 
     @property
     def name(self) -> str:
@@ -83,6 +105,7 @@ async def test_list_prompts():
 
     assert len(result.prompts) == 1
     assert result.prompts[0].name == "generate_code_review_instructions"
+    assert result.prompts[0].description is not None
     assert "code review" in result.prompts[0].description
 
 

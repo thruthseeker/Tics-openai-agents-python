@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Union
-
-from typing_extensions import TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from .items import RealtimeItem
 
@@ -84,6 +82,7 @@ class RealtimeModelInputAudioTranscriptionCompletedEvent:
 
     type: Literal["input_audio_transcription_completed"] = "input_audio_transcription_completed"
 
+
 @dataclass
 class RealtimeModelInputAudioTimeoutTriggeredEvent:
     """Input audio timeout triggered."""
@@ -93,6 +92,7 @@ class RealtimeModelInputAudioTimeoutTriggeredEvent:
     audio_end_ms: int
 
     type: Literal["input_audio_timeout_triggered"] = "input_audio_timeout_triggered"
+
 
 @dataclass
 class RealtimeModelTranscriptDeltaEvent:
@@ -177,21 +177,21 @@ class RealtimeModelRawServerEvent:
 # TODO (rm) Add usage events
 
 
-RealtimeModelEvent: TypeAlias = Union[
-    RealtimeModelErrorEvent,
-    RealtimeModelToolCallEvent,
-    RealtimeModelAudioEvent,
-    RealtimeModelAudioInterruptedEvent,
-    RealtimeModelAudioDoneEvent,
-    RealtimeModelInputAudioTimeoutTriggeredEvent,
-    RealtimeModelInputAudioTranscriptionCompletedEvent,
-    RealtimeModelTranscriptDeltaEvent,
-    RealtimeModelItemUpdatedEvent,
-    RealtimeModelItemDeletedEvent,
-    RealtimeModelConnectionStatusEvent,
-    RealtimeModelTurnStartedEvent,
-    RealtimeModelTurnEndedEvent,
-    RealtimeModelOtherEvent,
-    RealtimeModelExceptionEvent,
-    RealtimeModelRawServerEvent,
-]
+RealtimeModelEvent: TypeAlias = (
+    RealtimeModelErrorEvent
+    | RealtimeModelToolCallEvent
+    | RealtimeModelAudioEvent
+    | RealtimeModelAudioInterruptedEvent
+    | RealtimeModelAudioDoneEvent
+    | RealtimeModelInputAudioTimeoutTriggeredEvent
+    | RealtimeModelInputAudioTranscriptionCompletedEvent
+    | RealtimeModelTranscriptDeltaEvent
+    | RealtimeModelItemUpdatedEvent
+    | RealtimeModelItemDeletedEvent
+    | RealtimeModelConnectionStatusEvent
+    | RealtimeModelTurnStartedEvent
+    | RealtimeModelTurnEndedEvent
+    | RealtimeModelOtherEvent
+    | RealtimeModelExceptionEvent
+    | RealtimeModelRawServerEvent
+)

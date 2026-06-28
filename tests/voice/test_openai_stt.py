@@ -6,6 +6,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 try:
@@ -112,13 +113,13 @@ async def test_session_connects_and_configures_successfully():
         assert "wss://api.openai.com/v1/realtime?intent=transcription" in args[0]
         headers = kwargs.get("additional_headers", {})
         assert headers.get("Authorization") == "Bearer FAKE_KEY"
-        assert headers.get("OpenAI-Beta") == "realtime=v1"
+        assert headers.get("OpenAI-Beta") is None
         assert headers.get("OpenAI-Log-Session") == "1"
 
-        # Check that we sent a 'transcription_session.update' message
+        # Check that we sent a 'session.update' message
         sent_messages = [call.args[0] for call in mock_ws.send.call_args_list]
-        assert any('"type": "transcription_session.update"' in msg for msg in sent_messages), (
-            f"Expected 'transcription_session.update' in {sent_messages}"
+        assert any('"type": "session.update"' in msg for msg in sent_messages), (
+            f"Expected 'session.update' in {sent_messages}"
         )
 
         await session.close()
@@ -131,75 +132,69 @@ async def test_stream_audio_sends_correct_json():
     1) Base64-encodes the data.
     2) Sends the correct JSON message over the websocket.
     """
-    # Simulate a single "transcription_session.created" and "transcription_session.updated" event,
-    # before we test streaming.
-    mock_ws = create_mock_websocket(
-        [
-            json.dumps({"type": "transcription_session.created"}),
-            json.dumps({"type": "transcription_session.updated"}),
-        ]
+    mock_ws = create_mock_websocket([])
+    audio_input = StreamedAudioInput()
+    stt_settings = STTModelSettings()
+
+    session = OpenAISTTTranscriptionSession(
+        input=audio_input,
+        client=AsyncMock(api_key="FAKE_KEY"),
+        model="whisper-1",
+        settings=stt_settings,
+        trace_include_sensitive_data=False,
+        trace_include_sensitive_audio_data=False,
     )
+    session._websocket = mock_ws
 
-    with patch("websockets.connect", return_value=mock_ws):
-        # Prepare
-        audio_input = StreamedAudioInput()
-        stt_settings = STTModelSettings()
+    buffer1 = np.array([1, 2, 3, 4], dtype=np.int16)
+    queue: asyncio.Queue[npt.NDArray[np.int16 | np.float32] | None] = asyncio.Queue()
+    await queue.put(buffer1)
+    await queue.put(None)
 
-        session = OpenAISTTTranscriptionSession(
-            input=audio_input,
-            client=AsyncMock(api_key="FAKE_KEY"),
-            model="whisper-1",
-            settings=stt_settings,
-            trace_include_sensitive_data=False,
-            trace_include_sensitive_audio_data=False,
-        )
+    await session._stream_audio(queue)
 
-        # Kick off the transcribe_turns generator
-        turn_iter = session.transcribe_turns()
-        async for _ in turn_iter:
-            pass
+    append_messages = [
+        json.loads(call.args[0])
+        for call in mock_ws.send.call_args_list
+        if '"type": "input_audio_buffer.append"' in call.args[0]
+    ]
+    assert len(append_messages) == 1, "No 'input_audio_buffer.append' message was sent."
+    assert append_messages[0]["type"] == "input_audio_buffer.append"
+    assert "audio" in append_messages[0]
 
-        # Now push some audio data
-
-        buffer1 = np.array([1, 2, 3, 4], dtype=np.int16)
-        await audio_input.add_audio(buffer1)
-        await asyncio.sleep(0.1)  # give time for _stream_audio to consume
-        await asyncio.sleep(4)
-
-        # Check that the websocket sent an "input_audio_buffer.append" message
-        found_audio_append = False
-        for call_arg in mock_ws.send.call_args_list:
-            print("call_arg", call_arg)
-            print("test", session._turn_audio_buffer)
-            sent_str = call_arg.args[0]
-            print("sent_str", sent_str)
-            if '"type": "input_audio_buffer.append"' in sent_str:
-                msg_dict = json.loads(sent_str)
-                assert msg_dict["type"] == "input_audio_buffer.append"
-                assert "audio" in msg_dict
-                found_audio_append = True
-        assert found_audio_append, "No 'input_audio_buffer.append' message was sent."
-
-        await session.close()
+    await session.close()
 
 
 @pytest.mark.asyncio
-async def test_transcription_event_puts_output_in_queue():
+@pytest.mark.parametrize(
+    "created,updated,completed",
+    [
+        (
+            {"type": "transcription_session.created"},
+            {"type": "transcription_session.updated"},
+            {"type": "input_audio_transcription_completed", "transcript": "Hello world!"},
+        ),
+        (
+            {"type": "session.created"},
+            {"type": "session.updated"},
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "Hello world!",
+            },
+        ),
+    ],
+)
+async def test_transcription_event_puts_output_in_queue(created, updated, completed):
     """
-    Test that a 'input_audio_transcription_completed' event
+    Test that a 'input_audio_transcription_completed' event and
+    'conversation.item.input_audio_transcription.completed'
     yields a transcript from transcribe_turns().
     """
     mock_ws = create_mock_websocket(
         [
-            json.dumps({"type": "transcription_session.created"}),
-            json.dumps({"type": "transcription_session.updated"}),
-            # Once configured, we mock a completed transcription event:
-            json.dumps(
-                {
-                    "type": "input_audio_transcription_completed",
-                    "transcript": "Hello world!",
-                }
-            ),
+            json.dumps(created),
+            json.dumps(updated),
+            json.dumps(completed),
         ]
     )
 

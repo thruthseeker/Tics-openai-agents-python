@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import BaseModel
@@ -13,13 +13,13 @@ from agents import (
     UserError,
 )
 from agents.agent_output import _WRAPPER_DICT_KEY
-from agents.run import AgentRunner
+from agents.run_internal.run_loop import get_output_schema
 from agents.util import _json
 
 
 def test_plain_text_output():
     agent = Agent(name="test")
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert not output_schema, "Shouldn't have an output tool config without an output type"
 
     agent = Agent(name="test", output_type=str)
@@ -32,7 +32,7 @@ class Foo(BaseModel):
 
 def test_structured_output_pydantic():
     agent = Agent(name="test", output_type=Foo)
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
 
     assert isinstance(output_schema, AgentOutputSchema)
@@ -52,7 +52,7 @@ class Bar(TypedDict):
 
 def test_structured_output_typed_dict():
     agent = Agent(name="test", output_type=Bar)
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
     assert isinstance(output_schema, AgentOutputSchema)
     assert output_schema.output_type == Bar, "Should have the correct output type"
@@ -65,7 +65,7 @@ def test_structured_output_typed_dict():
 
 def test_structured_output_list():
     agent = Agent(name="test", output_type=list[str])
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
     assert isinstance(output_schema, AgentOutputSchema)
     assert output_schema.output_type == list[str], "Should have the correct output type"
@@ -77,16 +77,45 @@ def test_structured_output_list():
     assert validated == ["foo", "bar"]
 
 
+def test_structured_output_literal_name_handles_literal_values():
+    output_schema = AgentOutputSchema(output_type=cast(type[Any], Literal["ok"]))
+
+    assert output_schema.name() == "Literal['ok']"
+
+
+def test_structured_output_nested_literal_name_handles_literal_values():
+    output_schema = AgentOutputSchema(output_type=list[Literal["ok", "done"]])
+
+    assert output_schema.name() == "list[Literal['ok', 'done']]"
+
+
+def test_structured_output_generic_dict_is_not_wrapped():
+    output_schema = AgentOutputSchema(output_type=dict[str, int], strict_json_schema=False)
+    assert output_schema.output_type == dict[str, int]
+    assert not output_schema._is_wrapped, "Generic dict output should not be wrapped"
+    assert "response" not in output_schema.json_schema().get("properties", {})
+
+    validated = output_schema.validate_json(json.dumps({"foo": 1}))
+    assert validated == {"foo": 1}
+
+
+def test_structured_output_generic_dict_rejects_wrapper_shape():
+    output_schema = AgentOutputSchema(output_type=dict[str, int], strict_json_schema=False)
+
+    with pytest.raises(ModelBehaviorError):
+        output_schema.validate_json(json.dumps({"response": {"foo": 1}}))
+
+
 def test_bad_json_raises_error(mocker):
     agent = Agent(name="test", output_type=Foo)
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
 
     with pytest.raises(ModelBehaviorError):
         output_schema.validate_json("not valid json")
 
     agent = Agent(name="test", output_type=list[str])
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
 
     mock_validate_json = mocker.patch.object(_json, "validate_json")
@@ -155,7 +184,7 @@ class CustomOutputSchema(AgentOutputSchemaBase):
 def test_custom_output_schema():
     custom_output_schema = CustomOutputSchema()
     agent = Agent(name="test", output_type=custom_output_schema)
-    output_schema = AgentRunner._get_output_schema(agent)
+    output_schema = get_output_schema(agent)
 
     assert output_schema, "Should have an output tool config with a structured output type"
     assert isinstance(output_schema, CustomOutputSchema)

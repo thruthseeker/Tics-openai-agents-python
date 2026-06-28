@@ -1,13 +1,14 @@
 # Quickstart
 
-Realtime agents enable voice conversations with your AI agents using OpenAI's Realtime API. This guide walks you through creating your first realtime voice agent.
+Realtime agents in the Python SDK are server-side, low-latency agents built on the OpenAI Realtime API over WebSocket transport.
 
-!!! warning "Beta feature"
-Realtime agents are in beta. Expect some breaking changes as we improve the implementation.
+!!! note "Python SDK boundary"
+
+    The Python SDK does **not** provide a browser WebRTC transport. This page only covers Python-managed realtime sessions over server-side WebSockets. Use this SDK for server-side orchestration, tools, approvals, and telephony integrations. See also [Realtime transport](transport.md).
 
 ## Prerequisites
 
--   Python 3.9 or higher
+-   Python 3.10 or higher
 -   OpenAI API key
 -   Basic familiarity with the OpenAI Agents SDK
 
@@ -19,157 +20,135 @@ If you haven't already, install the OpenAI Agents SDK:
 pip install openai-agents
 ```
 
-## Creating your first realtime agent
+## Create a server-side realtime session
 
-### 1. Import required components
+### 1. Import the realtime components
 
 ```python
 import asyncio
+
 from agents.realtime import RealtimeAgent, RealtimeRunner
 ```
 
-### 2. Create a realtime agent
+### 2. Define the starting agent
 
 ```python
 agent = RealtimeAgent(
     name="Assistant",
-    instructions="You are a helpful voice assistant. Keep your responses conversational and friendly.",
+    instructions="You are a helpful voice assistant. Keep responses short and conversational.",
 )
 ```
 
-### 3. Set up the runner
+### 3. Configure the runner
+
+Prefer the nested `audio.input` / `audio.output` session settings shape for new code. For new realtime agents, start with `gpt-realtime-2`.
 
 ```python
 runner = RealtimeRunner(
     starting_agent=agent,
     config={
         "model_settings": {
-            "model_name": "gpt-4o-realtime-preview",
-            "voice": "alloy",
-            "modalities": ["text", "audio"],
+            "model_name": "gpt-realtime-2",
+            "audio": {
+                "input": {
+                    "format": "pcm16",
+                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": "pcm16",
+                    "voice": "ash",
+                },
+            },
         }
-    }
+    },
 )
 ```
 
-### 4. Start a session
+### 4. Start the session and send input
+
+`runner.run()` returns a `RealtimeSession`. The connection is opened when you enter the session context.
 
 ```python
-async def main():
-    # Start the realtime session
+async def main() -> None:
     session = await runner.run()
 
     async with session:
-        # Send a text message to start the conversation
-        await session.send_message("Hello! How are you today?")
+        await session.send_message("Say hello in one short sentence.")
 
-        # The agent will stream back audio in real-time (not shown in this example)
-        # Listen for events from the session
         async for event in session:
-            if event.type == "response.audio_transcript.done":
-                print(f"Assistant: {event.transcript}")
-            elif event.type == "conversation.item.input_audio_transcription.completed":
-                print(f"User: {event.transcript}")
-
-# Run the session
-asyncio.run(main())
-```
-
-## Complete example
-
-Here's a complete working example:
-
-```python
-import asyncio
-from agents.realtime import RealtimeAgent, RealtimeRunner
-
-async def main():
-    # Create the agent
-    agent = RealtimeAgent(
-        name="Assistant",
-        instructions="You are a helpful voice assistant. Keep responses brief and conversational.",
-    )
-
-    # Set up the runner with configuration
-    runner = RealtimeRunner(
-        starting_agent=agent,
-        config={
-            "model_settings": {
-                "model_name": "gpt-4o-realtime-preview",
-                "voice": "alloy",
-                "modalities": ["text", "audio"],
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 200
-                }
-            }
-        }
-    )
-
-    # Start the session
-    session = await runner.run()
-
-    async with session:
-        print("Session started! The agent will stream audio responses in real-time.")
-
-        # Process events
-        async for event in session:
-            if event.type == "response.audio_transcript.done":
-                print(f"Assistant: {event.transcript}")
-            elif event.type == "conversation.item.input_audio_transcription.completed":
-                print(f"User: {event.transcript}")
+            if event.type == "audio":
+                # Forward or play event.audio.data.
+                pass
+            elif event.type == "history_added":
+                print(event.item)
+            elif event.type == "agent_end":
+                # One assistant turn finished.
+                break
             elif event.type == "error":
                 print(f"Error: {event.error}")
-                break
+
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Configuration options
+`session.send_message()` accepts either a plain string or a structured realtime message. For raw audio chunks, use [`session.send_audio()`][agents.realtime.session.RealtimeSession.send_audio].
 
-### Model settings
+## What this quickstart does not include
 
--   `model_name`: Choose from available realtime models (e.g., `gpt-4o-realtime-preview`)
--   `voice`: Select voice (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`)
--   `modalities`: Enable text and/or audio (`["text", "audio"]`)
+-   Microphone capture and speaker playback code. See the realtime examples in [`examples/realtime`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime).
+-   SIP / telephony attach flows. See [Realtime transport](transport.md) and the [SIP section](guide.md#sip-and-telephony).
 
-### Audio settings
+## Key settings
 
--   `input_audio_format`: Format for input audio (`pcm16`, `g711_ulaw`, `g711_alaw`)
--   `output_audio_format`: Format for output audio
--   `input_audio_transcription`: Transcription configuration
+Once the basic session works, the settings most people reach for next are:
 
-### Turn detection
+-   `model_name`
+-   `audio.input.format`, `audio.output.format`
+-   `audio.input.transcription`
+-   `audio.input.noise_reduction`
+-   `audio.input.turn_detection` for automatic turn detection
+-   `audio.output.voice`
+-   `tool_choice`, `prompt`, `tracing`
+-   `async_tool_calls`, `tool_execution.pre_approval_tool_input_guardrails`, `guardrails_settings.debounce_text_length`, `tool_error_formatter`
 
--   `type`: Detection method (`server_vad`, `semantic_vad`)
--   `threshold`: Voice activity threshold (0.0-1.0)
--   `silence_duration_ms`: Silence duration to detect turn end
--   `prefix_padding_ms`: Audio padding before speech
+The older flat aliases such as `input_audio_format`, `output_audio_format`, `input_audio_transcription`, and `turn_detection` still work, but nested `audio` settings are preferred for new code.
 
-## Next steps
+For manual turn control, use a raw `session.update` / `input_audio_buffer.commit` / `response.create` flow as described in the [Realtime agents guide](guide.md#manual-response-control).
 
--   [Learn more about realtime agents](guide.md)
--   Check out working examples in the [examples/realtime](https://github.com/openai/openai-agents-python/tree/main/examples/realtime) folder
--   Add tools to your agent
--   Implement handoffs between agents
--   Set up guardrails for safety
+For the full schema, see [`RealtimeRunConfig`][agents.realtime.config.RealtimeRunConfig] and [`RealtimeSessionModelSettings`][agents.realtime.config.RealtimeSessionModelSettings].
 
-## Authentication
+## Connection options
 
-Make sure your OpenAI API key is set in your environment:
+Set your API key in the environment:
 
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
 ```
 
-Or pass it directly when creating the session:
+Or pass it directly when starting the session:
 
 ```python
 session = await runner.run(model_config={"api_key": "your-api-key"})
 ```
+
+`model_config` also supports:
+
+-   `url`: Custom WebSocket endpoint
+-   `headers`: Custom request headers
+-   `call_id`: Attach to an existing realtime call. In this repo, the documented attach flow is SIP.
+-   `playback_tracker`: Report how much audio the user has actually heard
+
+If you pass `headers` explicitly, the SDK will **not** inject an `Authorization` header for you.
+
+When connecting to Azure OpenAI, pass a GA Realtime endpoint URL in `model_config["url"]` and explicit headers. Avoid the legacy beta path (`/openai/realtime?api-version=...`) with realtime agents. See the [Realtime agents guide](guide.md#low-level-access-and-custom-endpoints) for details.
+
+## Next steps
+
+-   Read [Realtime transport](transport.md) to choose between server-side WebSocket and SIP.
+-   Read the [Realtime agents guide](guide.md) for lifecycle, structured input, approvals, handoffs, guardrails, and low-level control.
+-   Browse the examples in [`examples/realtime`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime).

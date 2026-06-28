@@ -1,7 +1,7 @@
 import pytest
 from pydantic import BaseModel
 
-from agents import Agent, Handoff, function_tool, handoff
+from agents import Agent, Handoff, function_tool, handoff, tool_namespace
 from agents.exceptions import UserError
 from agents.models.chatcmpl_converter import Converter
 from agents.tool import FileSearchTool, WebSearchTool
@@ -18,12 +18,21 @@ def test_to_openai_with_function_tool():
     result = Converter.tool_to_openai(tool)
 
     assert result["type"] == "function"
-    assert result["function"]["name"] == "some_function"
-    params = result.get("function", {}).get("parameters")
+    function_def = result["function"]
+    assert function_def["name"] == "some_function"
+    assert function_def["strict"] is True
+    params = function_def.get("parameters")
     assert params is not None
     properties = params.get("properties", {})
     assert isinstance(properties, dict)
     assert properties.keys() == {"a", "b"}
+
+
+def test_to_openai_respects_non_strict_function_tool():
+    tool = function_tool(some_function, strict_mode=False)
+    result = Converter.tool_to_openai(tool)
+
+    assert result["function"]["strict"] is False
 
 
 class Foo(BaseModel):
@@ -39,6 +48,7 @@ def test_convert_handoff_tool():
     assert result["type"] == "function"
     assert result["function"]["name"] == Handoff.default_tool_name(agent)
     assert result["function"].get("description") == Handoff.default_tool_description(agent)
+    assert result["function"].get("strict") is True
     params = result.get("function", {}).get("parameters")
     assert params is not None
 
@@ -52,3 +62,21 @@ def test_tool_converter_hosted_tools_errors():
 
     with pytest.raises(UserError):
         Converter.tool_to_openai(FileSearchTool(vector_store_ids=["abc"], max_num_results=1))
+
+
+def test_tool_converter_rejects_namespaced_function_tools_for_chat_backends():
+    tool = tool_namespace(
+        name="crm",
+        description="CRM tools",
+        tools=[function_tool(some_function)],
+    )[0]
+
+    with pytest.raises(UserError, match="tool_namespace\\(\\)"):
+        Converter.tool_to_openai(tool)
+
+
+def test_tool_converter_rejects_deferred_function_tools_for_chat_backends():
+    tool = function_tool(some_function, defer_loading=True)
+
+    with pytest.raises(UserError, match="defer_loading=True"):
+        Converter.tool_to_openai(tool)

@@ -1,21 +1,59 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from agents.models import _openai_shared
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_responses import OpenAIResponsesModel
 from agents.run import set_default_agent_runner
-from agents.tracing import set_trace_processors
-from agents.tracing.setup import get_trace_provider
+from agents.tracing.provider import DefaultTraceProvider
+from agents.tracing.setup import set_trace_provider
 
 from .testing_processor import SPAN_PROCESSOR_TESTING
+
+collect_ignore: list[str] = []
+
+if sys.platform == "win32":
+    collect_ignore.extend(
+        [
+            "test_example_workflows.py",
+            "test_run_state.py",
+            "sandbox/capabilities/test_filesystem_capability.py",
+            "sandbox/integration_tests/test_runner_pause_resume.py",
+            "sandbox/test_client_options.py",
+            "sandbox/test_exposed_ports.py",
+            "sandbox/test_extract.py",
+            "sandbox/test_memory.py",
+            "sandbox/test_runtime.py",
+            "sandbox/test_session_manager.py",
+            "sandbox/test_session_sinks.py",
+            "sandbox/test_snapshot.py",
+            "sandbox/test_unix_local.py",
+        ]
+    )
 
 
 # This fixture will run once before any tests are executed
 @pytest.fixture(scope="session", autouse=True)
 def setup_span_processor():
-    set_trace_processors([SPAN_PROCESSOR_TESTING])
+    provider = DefaultTraceProvider()
+    provider.set_processors([SPAN_PROCESSOR_TESTING])
+    set_trace_provider(provider)
+    yield
+    provider.shutdown()
+
+
+# Ensure a default OpenAI API key is present for tests that construct clients
+# without explicitly configuring a key/client. Tests that need no key use
+# monkeypatch.delenv("OPENAI_API_KEY", ...) to remove it locally.
+@pytest.fixture(scope="session", autouse=True)
+def ensure_openai_api_key():
+    import os
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = "test_key"
 
 
 # This fixture will run before each test
@@ -32,18 +70,12 @@ def clear_openai_settings():
     _openai_shared._default_openai_key = None
     _openai_shared._default_openai_client = None
     _openai_shared._use_responses_by_default = True
+    _openai_shared.set_default_openai_responses_transport("http")
 
 
 @pytest.fixture(autouse=True)
 def clear_default_runner():
     set_default_agent_runner(None)
-
-
-# This fixture will run after all tests end
-@pytest.fixture(autouse=True, scope="session")
-def shutdown_trace_provider():
-    yield
-    get_trace_provider().shutdown()
 
 
 @pytest.fixture(autouse=True)
